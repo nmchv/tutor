@@ -75,20 +75,29 @@ function generateId(table) {
 function nowIso() { return new Date().toISOString(); }
 function todayStr() { return new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Moscow' }); }
 
+function simpleHash(str) {
+  let h1 = 5381, h2 = 52711;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    h1 = ((h1 << 5) + h1) ^ c;
+    h2 = ((h2 << 5) + h2) ^ c;
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
 async function hashPw(pw) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw + Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('')));
-  return 's1$' + Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('') + '$' + Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('');
+  const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
+  const h = simpleHash(pw + saltHex);
+  return 's1$' + saltHex + '$' + h;
 }
 
 async function verifyPw(pw, stored) {
   try {
     const [v, s, h] = stored.split('$');
     if (v !== 's1') return false;
-    const salt = new Uint8Array(s.match(/.{2}/g).map(b => parseInt(b, 16)));
-    const calc = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw + Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('')));
-    const calcHex = Array.from(new Uint8Array(calc)).map(b => b.toString(16).padStart(2, '0')).join('');
-    return calcHex === h;
+    const calc = simpleHash(pw + s);
+    return calc === h;
   } catch { return false; }
 }
 
