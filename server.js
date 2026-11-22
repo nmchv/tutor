@@ -869,7 +869,7 @@ route('POST', '/api/admin/link', ({ user, body }) => {
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 const SEC = {
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'same-origin',
-  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' https: data:; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' https: data:; script-src 'self'; connect-src 'self' https://tutor.nmchv.ru; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 };
 function send(res, code, data, headers = {}) {
   const body = typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data);
@@ -887,7 +887,9 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   try {
-    const url = new URL(req.url, 'http://localhost');
+    const host = req.headers.host || 'localhost';
+    const proto = req.headers['x-forwarded-proto'] || 'http';
+    const url = new URL(req.url, `${proto}://${host}`);
     if (url.pathname.startsWith('/api/')) {
       const m = req.method;
       let found = null, params = [];
@@ -915,4 +917,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`NMCHV Student: http://localhost:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`NMCHV Student: http://localhost:${PORT}`));
