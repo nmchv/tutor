@@ -3,16 +3,18 @@ export const $ = (s, r = document) => r.querySelector(s);
 export const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-export const S = { me: null, sid: null, refresh: () => {} };
+export const S = { me: null, sid: null, accessToken: null, refresh: () => {} };
 export const isStaff = () => S.me && S.me.role !== 'student';
 export const href = (view) => (S.sid ? `#/student/${S.sid}/${view}` : `#/${view}`);
 
 export async function api(path, { method = 'GET', body } = {}) {
   let p = path;
   if (S.sid && !p.includes('student=')) p += (p.includes('?') ? '&' : '?') + 'student=' + S.sid;
+  const headers = { 'X-Requested-With': 'nmchv', ...(body ? { 'Content-Type': 'application/json' } : {}) };
+  if (S.accessToken) headers.Authorization = `Bearer ${S.accessToken}`;
   const res = await fetch(p, {
     method, credentials: 'same-origin',
-    headers: { 'X-Requested-With': 'nmchv', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   let data = {};

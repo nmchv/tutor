@@ -3,16 +3,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { db, q, hashPw, verifyPw, nowIso, todayStr, TZ } from './db.js';
-import { seedIfEmpty, DEMO } from './seed.js';
+import { createSupabaseClient, getUserFromToken } from './lib/supabase.js';
+import {
+  select, insert, update, remove, removeWhere, get,
+  client as supaClient,
+} from './lib/db.js';
 import { computeRoute, goalProgress, WEIGHT } from './progress.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
 const PORT = Number(process.env.PORT || 3000);
-const SESSION_DAYS = 14;
 
-seedIfEmpty();
+/* ───────── Supabase клиенты ───────── */
+// Клиент от имени текущего пользователя (JWT) — RLS применяется.
+function sbFor(accessToken) {
+  return createSupabaseClient(accessToken);
+}
+// Админский клиент (server-side, только service role) — для создания
+// пользователей и ролей. Не используется в клиентском коде.
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const sbAdmin = SERVICE_ROLE_KEY ? createSupabaseClient(SERVICE_ROLE_KEY) : null;
 
 /* ───────── утилиты ───────── */
 class HttpError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
@@ -32,7 +42,7 @@ const E = {
 
 function coerce(v, s, k) {
   const label = s.label || k;
-  if (s.t === 'bool') return v ? 1 : 0;
+  if (s.t === 'bool') return v ? true : false;
   if (v === null || v === undefined || v === '') {
     if (s.req) throw bad(`Поле «${label}» обязательно`);
     return s.t === 'str' || s.t === 'text' ? '' : null;
@@ -84,96 +94,101 @@ function V(body, spec, partial = false) {
   }
   return out;
 }
-const ins = (t, d) => { const k = Object.keys(d); return Number(q.run(`INSERT INTO ${t}(${k.join(',')}) VALUES(${k.map(() => '?').join(',')})`, ...k.map((x) => d[x] ?? null)).lastInsertRowid); };
-const upd = (t, id, d) => { const k = Object.keys(d); if (k.length) q.run(`UPDATE ${t} SET ${k.map((x) => x + '=?').join(',')} WHERE id=?`, ...k.map((x) => d[x] ?? null), id); };
 
 const isStaff = (u) => u.role === 'tutor' || u.role === 'admin';
-function assertAccess(u, studentId) {
-  if (!studentId) throw bad('Не найдено', 404);
-  if (u.role === 'student') { if (u.id !== studentId) throw bad('Нет доступа', 403); return; }
-  const st = q.get("SELECT id FROM users WHERE id=? AND role='student'", studentId);
-  if (!st) throw bad('Ученик не найден', 404);
-  if (u.role === 'admin') return;
-  if (!q.get('SELECT 1 x FROM tutor_students WHERE tutor_id=? AND student_id=?', u.id, studentId)) throw bad('Нет доступа к этому ученику', 403);
+
+/* ───────── авторизация (Supabase Auth) ───────── */
+// Извлекает Bearer-токен из заголовка Authorization.
+function extractToken(req) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
 }
-function scope(u, url) {
-  if (u.role === 'student') return u.id;
-  const sid = Number(url.searchParams.get('student'));
-  if (!sid) throw bad('Не указан ученик');
-  assertAccess(u, sid);
-  return sid;
+
+// Возвращает текущего пользователя из подтверждённой сессии Supabase Auth (JWT).
+// Подгружает роль из tutor_user_roles.
+async function currentUser(req) {
+  const token = extractToken(req);
+  if (!token) return null;
+  const user = await getUserFromToken(token);
+  if (!user) return null;
+  const sb = sbFor(token);
+  const row = await get(sb, 'tutor_user_roles', { user_id: user.id });
+  const role = row ? row.role : 'student';
+  const active = row === undefined || row.active !== false;
+  if (!active) return null;
+  return { id: user.id, email: user.email || '', role, token };
 }
+
 function needStaff(u) { if (!isStaff(u)) throw bad('Недостаточно прав', 403); }
 function needAdmin(u) { if (u.role !== 'admin') throw bad('Только для администратора', 403); }
-function own(table, id, u) {
-  const r = q.get(`SELECT * FROM ${table} WHERE id=?`, id);
+
+async function assertAccess(u, studentId) {
+  if (!studentId) throw bad('Не найдено', 404);
+  if (u.role === 'student') { if (u.id !== studentId) throw bad('Нет доступа', 403); return; }
+  const st = await get(sbFor(u.token), 'tutor_students', { tutor_id: u.id, student_id: studentId });
+  if (u.role === 'admin') return;
+  if (!st) throw bad('Нет доступа к этому ученику', 403);
+}
+
+function scope(u, url) {
+  if (u.role === 'student') return u.id;
+  const sid = url.searchParams.get('student');
+  if (!sid) throw bad('Не указан ученик');
+  // assertAccess is async; caller must await. Here we return sid and check inside.
+  return sid;
+}
+
+async function assertAccessBySid(u, sid) {
+  if (u.role === 'student') { if (u.id !== sid) throw bad('Нет доступа', 403); return sid; }
+  if (u.role === 'admin') return sid;
+  const st = await get(sbFor(u.token), 'tutor_students', { tutor_id: u.id, student_id: sid });
+  if (!st) throw bad('Нет доступа к этому ученику', 403);
+  return sid;
+}
+
+async function own(sb, table, id, u) {
+  const r = await get(sb, table, { id });
   if (!r) throw bad('Не найдено', 404);
-  assertAccess(u, r.student_id ?? r.owner_student_id);
+  const sid = r.student_id ?? r.owner_student_id;
+  if (sid) await assertAccessBySid(u, sid);
   return r;
 }
-const tutorsOf = (sid) => q.all('SELECT tutor_id FROM tutor_students WHERE student_id=?', sid).map((r) => r.tutor_id);
-const nameOf = (id) => q.get('SELECT full_name n FROM profiles WHERE user_id=?', id)?.n || '—';
 
-function log(sid, actor, kind, text) { q.run('INSERT INTO activity_logs(student_id,actor_id,kind,text,created_at) VALUES(?,?,?,?,?)', sid, actor, kind, text, nowIso()); }
+async function tutorsOf(sb, sid) {
+  const rows = await select(sb, 'tutor_students', { student_id: sid });
+  return rows.map((r) => r.tutor_id);
+}
+
+async function nameOf(sb, id) {
+  const p = await get(sb, 'profiles', { id });
+  return p ? p.full_name : '—';
+}
+
+async function log(sb, sid, actor, kind, text) {
+  await insert(sb, 'tutor_activity_logs', { student_id: sid, actor_id: actor, kind, text, created_at: new Date().toISOString() });
+}
+
 const FREQ = { all: null, important: ['task', 'comment', 'review', 'deadline'], minimal: ['comment', 'review'] };
-function notify(userId, kind, title, body = '', link = null, ref = null) {
-  const p = q.get('SELECT notify_freq f FROM profiles WHERE user_id=?', userId);
-  const allow = FREQ[p?.f || 'all'];
+async function notify(sb, userId, kind, title, body = '', link = null, ref = null) {
+  const p = await get(sb, 'profiles', { id: userId });
+  const allow = FREQ[p?.notify_freq || 'all'];
   if (allow && !allow.includes(kind)) return;
-  if (ref && q.get('SELECT 1 x FROM notifications WHERE user_id=? AND ref=?', userId, ref)) return;
-  q.run('INSERT INTO notifications(user_id,kind,title,body,link,ref,is_read,created_at) VALUES(?,?,?,?,?,?,0,?)', userId, kind, title, body, link, ref, nowIso());
-}
-
-/* ───────── сессии ───────── */
-const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
-function parseCookies(h) { const o = {}; (h || '').split(';').forEach((p) => { const i = p.indexOf('='); if (i > 0) o[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); }); return o; }
-function startSession(res, req, userId) {
-  const token = crypto.randomBytes(32).toString('hex');
-  q.run('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)', sha(token), userId, new Date(Date.now() + SESSION_DAYS * 864e5).toISOString());
-  const secure = process.env.COOKIE_SECURE === '1' || req.headers['x-forwarded-proto'] === 'https';
-  res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
-}
-function currentUser(req) {
-  const t = parseCookies(req.headers.cookie).sid;
-  if (!t) return null;
-  const s = q.get('SELECT s.user_id,s.expires_at FROM sessions s WHERE token_hash=?', sha(t));
-  if (!s) return null;
-  if (s.expires_at < nowIso()) { q.run('DELETE FROM sessions WHERE token_hash=?', sha(t)); return null; }
-  const u = q.get('SELECT id,email,role,active FROM users WHERE id=?', s.user_id);
-  if (!u || !u.active) return null;
-  return { ...u, token: t };
-}
-const attempts = new Map();
-function throttle(key, max = 8, windowMs = 600000) {
-  const now = Date.now(); const a = (attempts.get(key) || []).filter((t) => now - t < windowMs);
-  if (a.length >= max) throw bad('Слишком много попыток. Попробуйте позже.', 429);
-  a.push(now); attempts.set(key, a);
-}
-setInterval(() => { q.run('DELETE FROM sessions WHERE expires_at<?', nowIso()); attempts.clear(); }, 3600000).unref();
-
-const pwOk = (p) => { if (typeof p !== 'string' || p.length < 8 || p.length > 100) throw bad('Пароль: от 8 до 100 символов'); return p; };
-const emailOk = (e) => { if (typeof e !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim()) || e.length > 120) throw bad('Неверный email'); return e.trim().toLowerCase(); };
-
-function createUser({ email, password, role, full_name, main_goal = '', directions = [], tutorId = null }) {
-  email = emailOk(email); pwOk(password);
-  if (!full_name || !full_name.trim()) throw bad('Укажите имя');
-  if (q.get('SELECT 1 x FROM users WHERE email=?', email)) throw bad('Пользователь с таким email уже существует', 409);
-  const id = ins('users', { email, password_hash: hashPw(password), role, active: 1, created_at: nowIso() });
-  ins('profiles', { user_id: id, full_name: full_name.trim().slice(0, 100), main_goal: String(main_goal).slice(0, 300), directions: JSON.stringify(directions.slice(0, 12).map((d) => String(d).slice(0, 60))), start_date: todayStr() });
-  if (role === 'student') {
-    ins('learning_routes', { student_id: id, title: 'Образовательный маршрут', created_at: nowIso() });
-    if (tutorId) ins('tutor_students', { tutor_id: tutorId, student_id: id, created_at: nowIso() });
-    log(id, tutorId, 'start', 'Начало работы в NMCHV Student');
+  if (ref) {
+    const existing = await get(sb, 'notifications', { user_id: userId, ref });
+    if (existing) return;
   }
-  return id;
+  await insert(sb, 'notifications', { user_id: userId, kind, title, body, link, ref, is_read: false, created_at: new Date().toISOString() });
 }
 
-function me(u) {
-  const p = q.get('SELECT * FROM profiles WHERE user_id=?', u.id);
-  return { id: u.id, email: u.email, role: u.role, profile: { ...p, directions: JSON.parse(p.directions || '[]') } };
+/* ───────── профиль / пользователь ───────── */
+async function me(sb, u) {
+  const p = await get(sb, 'profiles', { id: u.id });
+  const profile = p ? { ...p, directions: JSON.parse(p.directions || '[]') } : null;
+  return { id: u.id, email: u.email, role: u.role, profile };
 }
 
-/* ───────── спецификации полей ───────── */
+/* ───────── валидация ссылок ───────── */
 const S = {
   goal: {
     title: { t: 'str', req: 1, label: 'Название' }, description: { t: 'text', label: 'Описание' },
@@ -226,43 +241,86 @@ function criteriaOf(v) {
   if (!Array.isArray(v) || v.length > 20) throw bad('Критерии: не более 20');
   return JSON.stringify(v.map((c) => ({ text: String(c.text || '').trim().slice(0, 200), done: !!c.done })).filter((c) => c.text));
 }
-function checkRefs(sid, d) {
-  if (d.stage_id && !q.get('SELECT 1 x FROM route_stages WHERE id=? AND student_id=?', d.stage_id, sid)) throw bad('Этап не найден');
-  if (d.milestone_id && !q.get('SELECT 1 x FROM milestones WHERE id=? AND student_id=?', d.milestone_id, sid)) throw bad('Контрольная точка не найдена');
-  if (d.goal_id && !q.get('SELECT 1 x FROM educational_goals WHERE id=? AND student_id=?', d.goal_id, sid)) throw bad('Цель не найдена');
+async function checkRefs(sb, sid, d) {
+  if (d.stage_id && !(await get(sb, 'tutor_route_stages', { id: d.stage_id, student_id: sid }))) throw bad('Этап не найден');
+  if (d.milestone_id && !(await get(sb, 'tutor_milestones', { id: d.milestone_id, student_id: sid }))) throw bad('Контрольная точка не найдена');
+  if (d.goal_id && !(await get(sb, 'tutor_educational_goals', { id: d.goal_id, student_id: sid }))) throw bad('Цель не найден');
 }
 
 /* ───────── маршруты API ───────── */
 const R = [];
 const route = (method, re, fn, pub = false) => R.push({ method, re: new RegExp('^' + re + '$'), fn, pub });
 
-route('GET', '/api/public', () => ({ demo: DEMO.enabled, accounts: DEMO.enabled ? DEMO.accounts : [] }), true);
-
-route('POST', '/api/auth/login', ({ req, res, body }) => {
+route('GET', '/api/public', () => ({ demo: false, accounts: [] }), true);
+route('POST', '/api/auth/login', async ({ req, res, body }) => {
   const email = String(body.email || '').trim().toLowerCase();
-  throttle('l:' + req.socket.remoteAddress + email);
-  const u = q.get('SELECT * FROM users WHERE email=?', email);
-  if (!u || !u.active || !verifyPw(String(body.password || ''), u.password_hash)) throw bad('Неверный email или пароль', 401);
-  startSession(res, req, u.id);
-  return me(u);
+  const sb = sbFor(null);
+  const { data, error } = await sb.auth.signInWithPassword({ email, password: String(body.password || '') });
+  if (error || !data.user) throw bad('Неверный email или пароль', 401);
+  const u = await currentUserFromToken(req, data.session.access_token);
+  res.setHeader('Set-Cookie', `sb-token=${data.session.access_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${14 * 86400}`);
+  return { ...u, access_token: data.session.access_token };
 }, true);
 
-route('POST', '/api/auth/register', ({ req, res, body }) => {
-  throttle('r:' + req.socket.remoteAddress, 5, 3600000);
-  const id = createUser({ email: body.email, password: body.password, role: 'student', full_name: String(body.full_name || '') });
-  startSession(res, req, id);
-  return me({ id, email: String(body.email).trim().toLowerCase(), role: 'student' });
+route('POST', '/api/auth/register', async ({ req, res, body }) => {
+  const email = String(body.email || '').trim().toLowerCase();
+  const full_name = String(body.full_name || '').trim();
+  if (!full_name) throw bad('Укажите имя');
+  const sb = sbFor(null);
+  const { data, error } = await sb.auth.signUp({ email, password: String(body.password || ''), options: { data: { full_name } } });
+  if (error || !data.user) throw bad(error?.message || 'Не удалось создать аккаунт', 400);
+  if (!data.session) throw bad('Не удалось создать сессию', 400);
+  const u = await currentUserFromToken(req, data.session.access_token);
+  // Создаём профиль, роль и маршрут от имени нового пользователя (он сам студент).
+  const sbUser = sbFor(data.session.access_token);
+  await insert(sbUser, 'profiles', { id: u.id, email, full_name, start_date: todayStr() });
+  await insert(sbUser, 'tutor_user_roles', { user_id: u.id, role: 'student', active: true });
+  await insert(sbUser, 'tutor_learning_routes', { student_id: u.id, title: 'Образовательный маршрут', created_at: new Date().toISOString() });
+  await log(sbUser, u.id, u.id, 'start', 'Начало работы в NMCHV Student');
+  res.setHeader('Set-Cookie', `sb-token=${data.session.access_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${14 * 86400}`);
+  return { ...u, access_token: data.session.access_token };
 }, true);
 
-route('POST', '/api/auth/logout', ({ user, res }) => {
-  q.run('DELETE FROM sessions WHERE token_hash=?', sha(user.token));
-  res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+route('POST', '/api/auth/logout', async ({ user, res }) => {
+  const token = user.token;
+
+  const sb = sbFor(token);
+  try { await sb.auth.signOut(); } catch {}
+  res.setHeader('Set-Cookie', 'sb-token=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   return { ok: true };
 });
 
-route('GET', '/api/me', ({ user }) => me(user));
+/* ── единый вход NMCHV (login.nmchv.ru) ── */
+// Общая авторизация NMCHV: после входа на login.nmchv.ru браузер перенаправляется
+// сюда с параметром ?token=<JWT>. Мы сохраняем токен в HttpOnly-cookie и возвращаем
+// пользователя в приложение.
+route('GET', '/api/auth/callback', async ({ req, res, url }) => {
+  const token = url.searchParams.get('token');
+  if (!token) throw bad('Токен сессии не передан', 400);
+  const user = await currentUserFromToken(req, token);
+  if (!user) throw bad('Недействительный токен сессии', 401);
+  res.setHeader('Set-Cookie', `sb-token=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${14 * 86400}`);
+  const redirect = url.searchParams.get('redirect') || '/';
+  res.writeHead(302, { Location: redirect, 'Cache-Control': 'no-store' });
+  res.end();
+});
 
-route('PATCH', '/api/me', ({ user, body }) => {
+async function currentUserFromToken(req, token) {
+  const user = await getUserFromToken(token);
+  if (!user) return null;
+  const sb = sbFor(token);
+  const row = await get(sb, 'tutor_user_roles', { user_id: user.id });
+  const role = row ? row.role : 'student';
+  return { id: user.id, email: user.email || '', role, token };
+}
+
+route('GET', '/api/me', async ({ user }) => {
+  const sb = sbFor(user.token);
+  return me(sb, user);
+});
+
+route('PATCH', '/api/me', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   const d = V(body, {
     full_name: { t: 'str', req: 1, label: 'Имя' }, photo_url: { t: 'url', label: 'Фото' }, bio: { t: 'text', max: 800, label: 'О себе' },
     main_goal: { t: 'str', max: 300, label: 'Основная цель' }, status: { t: 'str', max: 80, label: 'Статус' },
@@ -274,211 +332,258 @@ route('PATCH', '/api/me', ({ user, body }) => {
   }
   if (user.role !== 'student') delete d.main_goal;
   const k = Object.keys(d);
-  if (k.length) q.run(`UPDATE profiles SET ${k.map((x) => x + '=?').join(',')} WHERE user_id=?`, ...k.map((x) => d[x] ?? null), user.id);
-  return me(user);
+  if (k.length) {
+    const existing = await get(sb, 'profiles', { id: user.id });
+    if (existing) await update(sb, 'profiles', user.id, d);
+    else await insert(sb, 'profiles', { id: user.id, email: user.email, ...d, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  }
+  return me(sb, user);
 });
 
-route('POST', '/api/me/password', ({ user, body }) => {
-  const u = q.get('SELECT password_hash h FROM users WHERE id=?', user.id);
-  if (!verifyPw(String(body.current || ''), u.h)) throw bad('Текущий пароль неверен', 403);
-  q.run('UPDATE users SET password_hash=? WHERE id=?', hashPw(pwOk(body.next)), user.id);
-  q.run('DELETE FROM sessions WHERE user_id=? AND token_hash<>?', user.id, sha(user.token));
+route('POST', '/api/me/password', async ({ user, body }) => {
+  const sb = sbFor(user.token);
+  const pwOk = (p) => { if (typeof p !== 'string' || p.length < 8 || p.length > 100) throw bad('Пароль: от 8 до 100 символов'); return p; };
+  const { error } = await sb.auth.updateUser({ password: pwOk(body.next) });
+  if (error) throw bad('Не удалось сменить пароль', 400);
   return { ok: true };
 });
 
 /* ── панель ученика ── */
-route('GET', '/api/dashboard', ({ user, url }) => {
-  const sid = scope(user, url);
-  const p = q.get('SELECT * FROM profiles WHERE user_id=?', sid);
-  const r = computeRoute(sid);
-  const goals = goalProgress(sid);
+route('GET', '/api/dashboard', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const p = await get(sb, 'profiles', { id: sid });
+  const r = await computeRoute(sb, sid);
+  const goals = await goalProgress(sb, sid);
   const T = todayStr();
-  const tasks = q.all(`SELECT t.*, s.title stage_title FROM tasks t LEFT JOIN route_stages s ON s.id=t.stage_id
-    WHERE t.student_id=? AND t.status NOT IN ('Выполнено') ORDER BY (t.due_date IS NULL), t.due_date, t.id LIMIT 7`, sid);
-  const nowMin = new Date().toLocaleString('sv-SE', { timeZone: TZ }).slice(0, 16).replace(' ', 'T');
-  const events = q.all('SELECT * FROM events WHERE student_id=? AND starts_at>=? ORDER BY starts_at LIMIT 6', sid, nowMin);
-  const mile = q.all(`SELECT m.id,m.title,m.due_date,s.title stage_title FROM milestones m JOIN route_stages s ON s.id=m.stage_id
-    WHERE m.student_id=? AND m.done=0 AND m.due_date>=? ORDER BY m.due_date LIMIT 5`, sid, T);
+  const tasks = await select(sb, 'tutor_tasks', { student_id: sid }, { order: 'due_date,id' });
+  const openTasks = tasks.filter((t) => t.status !== 'Выполнено').sort((a, b) => ((a.due_date || '9').localeCompare(b.due_date || '9'))).slice(0, 7);
+  const nowMin = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Moscow' }).slice(0, 16).replace(' ', 'T');
+  const events = await select(sb, 'tutor_events', { student_id: sid }, { order: 'starts_at' });
+  const upcomingEvents = events.filter((e) => e.starts_at && e.starts_at.slice(0, 16) >= nowMin).slice(0, 6);
+  const Tdate = T;
+  const mile = await select(sb, 'tutor_milestones', { student_id: sid, done: false }, { order: 'due_date,id' });
+  const upcomingMile = mile.filter((m) => m.due_date && m.due_date >= Tdate).slice(0, 5);
   const upcoming = [
-    ...events.map((e) => ({ kind: e.kind, title: e.title, at: e.starts_at, note: e.note })),
-    ...mile.filter((m) => !r.stages.flatMap((s) => s.milestones).find((x) => x.id === m.id)?.done).map((m) => ({ kind: 'checkpoint', title: m.title, at: m.due_date, note: m.stage_title })),
-    ...tasks.filter((t) => t.due_date && t.due_date >= T && ['Высокий', 'Критический'].includes(t.priority)).map((t) => ({ kind: 'deadline', title: t.title, at: t.due_date, note: 'Дедлайн задачи' })),
-  ].sort((a, b) => a.at.localeCompare(b.at)).slice(0, 7);
-  const activity = q.all(`SELECT a.*, p.full_name actor FROM activity_logs a LEFT JOIN profiles p ON p.user_id=a.actor_id
-    WHERE a.student_id=? ORDER BY a.created_at DESC, a.id DESC LIMIT 8`, sid);
-  const comment = q.get(`SELECT a.text, a.created_at, p.full_name actor FROM activity_logs a LEFT JOIN profiles p ON p.user_id=a.actor_id
-    WHERE a.student_id=? AND a.kind='tutor_comment' ORDER BY a.created_at DESC, a.id DESC LIMIT 1`, sid);
-  const overdue = q.get("SELECT COUNT(*) c FROM tasks WHERE student_id=? AND status<>'Выполнено' AND due_date<?", sid, T).c;
+    ...upcomingEvents.map((e) => ({ kind: e.kind, title: e.title, at: e.starts_at, note: e.note })),
+    ...upcomingMile.filter((m) => !r.stages.flatMap((s) => s.milestones).find((x) => x.id === m.id)?.done).map((m) => ({ kind: 'checkpoint', title: m.title, at: m.due_date, note: '' })),
+    ...openTasks.filter((t) => t.due_date && t.due_date >= Tdate && ['Высокий', 'Критический'].includes(t.priority)).map((t) => ({ kind: 'deadline', title: t.title, at: t.due_date, note: 'Дедлайн задачи' })),
+  ].sort((a, b) => String(a.at).localeCompare(String(b.at))).slice(0, 7);
+  const activity = await select(sb, 'tutor_activity_logs', { student_id: sid }, { order: 'created_at,id', limit: 8 });
+  const activityWithActor = await Promise.all(activity.map(async (a) => {
+    const actor = a.actor_id ? await nameOf(sb, a.actor_id) : '';
+    return { ...a, actor };
+  }));
+  const comment = await get(sb, 'tutor_activity_logs', { student_id: sid, kind: 'tutor_comment' });
+  const commentRow = comment ? { ...comment, actor: comment.actor_id ? await nameOf(sb, comment.actor_id) : '' } : null;
+  const overdueRow = await get(sb, 'tutor_tasks', { student_id: sid });
+  const overdue = tasks.filter((t) => t.status !== 'Выполнено' && t.due_date && t.due_date < T).length;
   return {
     profile: { ...p, directions: JSON.parse(p.directions || '[]') },
     overall: r.overall, doneStages: r.doneStages, totalStages: r.totalStages, tasksDone: r.tasksDone, tasksTotal: r.tasksTotal,
     activeGoals: goals.filter((g) => g.status === 'Активна').length,
-    days: p.start_date ? Math.max(0, Math.floor((Date.parse(T) - Date.parse(p.start_date)) / 864e5)) : 0,
+    days: p?.start_date ? Math.max(0, Math.floor((Date.parse(T) - Date.parse(p.start_date)) / 864e5)) : 0,
     current: r.current && { id: r.current.id, title: r.current.title, pct: r.current.pct, end_date: r.current.end_date },
     mainGoal: goals.find((g) => g.status === 'Активна' && g.priority === 'Высокий') || goals.find((g) => g.status === 'Активна') || null,
-    tasks, upcoming, activity, comment, overdue, today: T,
+    tasks: openTasks, upcoming, activity: activityWithActor, comment: commentRow, overdue, today: T,
   };
 });
 
 /* ── маршрут ── */
-route('GET', '/api/route', ({ user, url }) => {
-  const sid = scope(user, url);
-  const r = computeRoute(sid);
-  const goals = Object.fromEntries(goalProgress(sid).map((g) => [g.id, g.title]));
-  const tasks = q.all('SELECT id,stage_id,milestone_id,title,status,priority,due_date,type FROM tasks WHERE student_id=? ORDER BY (due_date IS NULL),due_date,id', sid);
+route('GET', '/api/route', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const r = await computeRoute(sb, sid);
+  const goalsMap = Object.fromEntries((await goalProgress(sb, sid)).map((g) => [g.id, g.title]));
+  const tasks = await select(sb, 'tutor_tasks', { student_id: sid }, { order: 'due_date,id' });
   const stages = r.stages.map((s) => ({
-    ...s, goal_title: goals[s.goal_id] || null,
+    ...s, goal_title: goalsMap[s.goal_id] || null,
     milestones: s.milestones.map((m) => ({ ...m, tasks: tasks.filter((t) => t.milestone_id === m.id) })),
     looseTasks: tasks.filter((t) => t.stage_id === s.id && !t.milestone_id),
   }));
-  const history = q.all(`SELECT a.id,a.text,a.created_at,p.full_name actor FROM activity_logs a LEFT JOIN profiles p ON p.user_id=a.actor_id
-    WHERE a.student_id=? AND a.kind='route' ORDER BY a.created_at DESC, a.id DESC LIMIT 30`, sid);
-  const goalList = q.all('SELECT id,title FROM educational_goals WHERE student_id=? ORDER BY id', sid);
-  return { overall: r.overall, doneStages: r.doneStages, stages, history, goals: goalList, today: todayStr() };
+  const history = await select(sb, 'tutor_activity_logs', { student_id: sid, kind: 'route' }, { order: 'created_at,id', limit: 30 });
+  const goalList = await select(sb, 'tutor_educational_goals', { student_id: sid }, { order: 'id' });
+  return { overall: r.overall, doneStages: r.doneStages, stages, history, goals: goalList.map((g) => ({ id: g.id, title: g.title })), today: todayStr() };
 });
 
-function stageOwn(u, id) { return own('route_stages', id, u); }
-route('POST', '/api/stages', ({ user, url, body }) => {
-  needStaff(user); const sid = scope(user, url);
-  const d = V(body, S.stage); checkRefs(sid, d);
-  const rt = q.get('SELECT id FROM learning_routes WHERE student_id=?', sid);
-  const pos = (q.get('SELECT MAX(position) m FROM route_stages WHERE student_id=?', sid).m ?? -1) + 1;
-  const id = ins('route_stages', { ...d, weight: d.weight || 1, priority: d.priority || 'Обычный', route_id: rt.id, student_id: sid, position: pos });
-  log(sid, user.id, 'route', `Добавлен этап «${d.title}»`);
-  notify(sid, 'route', 'Изменён маршрут', `Добавлен этап «${d.title}»`, '#/route');
-  return { id };
+async function stageOwn(sb, user, id) {
+  return own(sb, 'tutor_route_stages', id, user);
+}
+route('POST', '/api/stages', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const d = V(body, S.stage);
+  await checkRefs(sb, sid, d);
+  const rt = await get(sb, 'tutor_learning_routes', { student_id: sid });
+  if (!rt) throw bad('Маршрут не найден', 404);
+  const posRow = await get(sb, 'tutor_route_stages', { student_id: sid });
+  const allStages = await select(sb, 'tutor_route_stages', { student_id: sid }, { order: 'position,id' });
+  const pos = allStages.length;
+  const inserted = await insert(sb, 'tutor_route_stages', { ...d, weight: d.weight || 1, priority: d.priority || 'Обычный', route_id: rt.id, student_id: sid, position: pos });
+  await log(sb, sid, user.id, 'route', `Добавлен этап «${d.title}»`);
+  await notify(sb, sid, 'route', 'Изменён маршрут', `Добавлен этап «${d.title}»`, '#/route');
+  return { id: inserted.id };
 });
-route('PATCH', '/api/stages/(\\d+)', ({ user, params, body }) => {
-  needStaff(user); const s = stageOwn(user, +params[0]);
-  const d = V(body, S.stage, true); checkRefs(s.student_id, d);
-  upd('route_stages', s.id, d);
+route('PATCH', '/api/stages/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const s = await stageOwn(sb, user, +params[0]);
+  const d = V(body, S.stage, true);
+  await checkRefs(sb, s.student_id, d);
+  await update(sb, 'tutor_route_stages', s.id, d);
   const what = d.end_date && d.end_date !== s.end_date ? `Срок этапа «${s.title}» перенесён на ${d.end_date}` : `Обновлён этап «${d.title || s.title}»`;
-  log(s.student_id, user.id, 'route', what);
-  notify(s.student_id, 'route', 'Изменён маршрут', what, '#/route');
+  await log(sb, s.student_id, user.id, 'route', what);
+  await notify(sb, s.student_id, 'route', 'Изменён маршрут', what, '#/route');
   return { ok: true };
 });
-route('DELETE', '/api/stages/(\\d+)', ({ user, params }) => {
-  needStaff(user); const s = stageOwn(user, +params[0]);
-  q.run('DELETE FROM route_stages WHERE id=?', s.id);
-  log(s.student_id, user.id, 'route', `Удалён этап «${s.title}»`);
-  notify(s.student_id, 'route', 'Изменён маршрут', `Удалён этап «${s.title}»`, '#/route');
+route('DELETE', '/api/stages/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const s = await stageOwn(sb, user, +params[0]);
+  await remove(sb, 'tutor_route_stages', s.id);
+  await log(sb, s.student_id, user.id, 'route', `Удалён этап «${s.title}»`);
+  await notify(sb, s.student_id, 'route', 'Изменён маршрут', `Удалён этап «${s.title}»`, '#/route');
   return { ok: true };
 });
-route('POST', '/api/stages/(\\d+)/move', ({ user, params, body }) => {
-  needStaff(user); const s = stageOwn(user, +params[0]);
+route('POST', '/api/stages/(\\d+)/move', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const s = await stageOwn(sb, user, +params[0]);
   const dir = body.dir === 1 ? 1 : body.dir === -1 ? -1 : 0; if (!dir) throw bad('Неверное направление');
-  const all = q.all('SELECT id FROM route_stages WHERE student_id=? ORDER BY position,id', s.student_id).map((r) => r.id);
-  const i = all.indexOf(s.id), j = i + dir;
-  if (j < 0 || j >= all.length) return { ok: true };
-  [all[i], all[j]] = [all[j], all[i]];
-  all.forEach((id, k) => q.run('UPDATE route_stages SET position=? WHERE id=?', k, id));
-  log(s.student_id, user.id, 'route', `Изменена последовательность этапов («${s.title}»)`);
-  notify(s.student_id, 'route', 'Изменён маршрут', `Изменён порядок этапов: «${s.title}»`, '#/route');
+  const all = await select(sb, 'tutor_route_stages', { student_id: s.student_id }, { order: 'position,id' });
+  const ids = all.map((r) => r.id);
+  const i = ids.indexOf(s.id), j = i + dir;
+  if (j < 0 || j >= ids.length) return { ok: true };
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  for (const [k, id] of ids.entries()) await update(sb, 'tutor_route_stages', id, { position: k });
+  await log(sb, s.student_id, user.id, 'route', `Изменена последовательность этапов («${s.title}»)`);
+  await notify(sb, s.student_id, 'route', 'Изменён маршрут', `Изменён порядок этапов: «${s.title}»`, '#/route');
   return { ok: true };
 });
-route('POST', '/api/stages/(\\d+)/milestones', ({ user, params, body }) => {
-  needStaff(user); const s = stageOwn(user, +params[0]);
+route('POST', '/api/stages/(\\d+)/milestones', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const s = await stageOwn(sb, user, +params[0]);
   const d = V(body, S.milestone);
-  const pos = (q.get('SELECT MAX(position) m FROM milestones WHERE stage_id=?', s.id).m ?? -1) + 1;
-  const id = ins('milestones', { ...d, done: d.done || 0, done_at: d.done ? nowIso() : null, stage_id: s.id, student_id: s.student_id, position: pos });
-  log(s.student_id, user.id, 'route', `Добавлена контрольная точка «${d.title}» в этап «${s.title}»`);
-  notify(s.student_id, 'route', 'Изменён маршрут', `Новая контрольная точка: «${d.title}»`, '#/route');
-  return { id };
+  const allMs = await select(sb, 'tutor_milestones', { stage_id: s.id }, { order: 'position,id' });
+  const pos = allMs.length;
+  const inserted = await insert(sb, 'tutor_milestones', { ...d, done: d.done || false, done_at: d.done ? new Date().toISOString() : null, stage_id: s.id, student_id: s.student_id, position: pos });
+  await log(sb, s.student_id, user.id, 'route', `Добавлена контрольная точка «${d.title}» в этап «${s.title}»`);
+  await notify(sb, s.student_id, 'route', 'Изменён маршрут', `Новая контрольная точка: «${d.title}»`, '#/route');
+  return { id: inserted.id };
 });
-route('PATCH', '/api/milestones/(\\d+)', ({ user, params, body }) => {
-  needStaff(user); const m = own('milestones', +params[0], user);
+route('PATCH', '/api/milestones/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const m = await own(sb, 'tutor_milestones', +params[0], user);
   const d = V(body, S.milestone, true);
-  if (d.done !== undefined) d.done_at = d.done ? nowIso() : null;
-  upd('milestones', m.id, d);
-  if (d.done && !m.done) log(m.student_id, user.id, 'milestone', `Достигнута контрольная точка «${m.title}»`);
+  if (d.done !== undefined) d.done_at = d.done ? new Date().toISOString() : null;
+  await update(sb, 'tutor_milestones', m.id, d);
+  if (d.done && !m.done) await log(sb, m.student_id, user.id, 'milestone', `Достигнута контрольная точка «${m.title}»`);
   return { ok: true };
 });
-route('DELETE', '/api/milestones/(\\d+)', ({ user, params }) => {
-  needStaff(user); const m = own('milestones', +params[0], user);
-  q.run('DELETE FROM milestones WHERE id=?', m.id);
-  log(m.student_id, user.id, 'route', `Удалена контрольная точка «${m.title}»`);
+route('DELETE', '/api/milestones/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const m = await own(sb, 'tutor_milestones', +params[0], user);
+  await remove(sb, 'tutor_milestones', m.id);
+  await log(sb, m.student_id, user.id, 'route', `Удалена контрольная точка «${m.title}»`);
   return { ok: true };
 });
 
 /* ── цели ── */
-route('GET', '/api/goals', ({ user, url }) => {
-  const sid = scope(user, url);
-  const stages = q.all('SELECT id,title,goal_id FROM route_stages WHERE student_id=? ORDER BY position', sid);
-  return { goals: goalProgress(sid).map((g) => ({ ...g, stageList: stages.filter((s) => s.goal_id === g.id) })), stages };
+route('GET', '/api/goals', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const stages = await select(sb, 'tutor_route_stages', { student_id: sid }, { order: 'position' });
+  const goals = await goalProgress(sb, sid);
+  return { goals: goals.map((g) => ({ ...g, stageList: stages.filter((s) => s.goal_id === g.id) })), stages };
 });
-route('POST', '/api/goals', ({ user, url, body }) => {
-  const sid = scope(user, url);
+route('POST', '/api/goals', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const d = V(body, S.goal);
   const crit = criteriaOf(body.criteria);
-  const id = ins('educational_goals', {
+  const inserted = await insert(sb, 'tutor_educational_goals', {
     ...d, student_id: sid, set_date: d.set_date || todayStr(), priority: d.priority || 'Обычный', status: d.status || 'Активна',
-    criteria: crit || '[]', created_by: user.id, created_at: nowIso(),
+    criteria: crit || '[]', created_by: user.id, created_at: new Date().toISOString(),
   });
-  log(sid, user.id, 'goal', `Добавлена цель «${d.title}»`);
-  if (isStaff(user)) notify(sid, 'route', 'Новая цель', `«${d.title}»`, '#/goals');
-  return { id };
+  await log(sb, sid, user.id, 'goal', `Добавлена цель «${d.title}»`);
+  if (isStaff(user)) await notify(sb, sid, 'route', 'Новая цель', `«${d.title}»`, '#/goals');
+  return { id: inserted.id };
 });
-route('PATCH', '/api/goals/(\\d+)', ({ user, params, body }) => {
-  const g = own('educational_goals', +params[0], user);
+route('PATCH', '/api/goals/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  const g = await own(sb, 'tutor_educational_goals', +params[0], user);
   const d = V(body, S.goal, true);
   const crit = criteriaOf(body.criteria); if (crit !== undefined) d.criteria = crit;
   if (isStaff(user) && body.tutor_comment !== undefined) {
     d.tutor_comment = coerce(body.tutor_comment, { t: 'text', max: 1500, label: 'Комментарий' }, 'tutor_comment');
-    if (d.tutor_comment && d.tutor_comment !== g.tutor_comment) notify(g.student_id, 'comment', 'Комментарий к цели', `«${g.title}»`, '#/goals');
+    if (d.tutor_comment && d.tutor_comment !== g.tutor_comment) await notify(sb, g.student_id, 'comment', 'Комментарий к цели', `«${g.title}»`, '#/goals');
   }
   if (user.role === 'student' && g.created_by !== user.id) { for (const k of Object.keys(d)) if (k !== 'criteria') delete d[k]; }
-  upd('educational_goals', g.id, d);
-  if (d.status === 'Достигнута' && g.status !== 'Достигнута') log(g.student_id, user.id, 'goal', `Цель достигнута: «${g.title}»`);
+  await update(sb, 'tutor_educational_goals', g.id, d);
+  if (d.status === 'Достигнута' && g.status !== 'Достигнута') await log(sb, g.student_id, user.id, 'goal', `Цель достигнута: «${g.title}»`);
   return { ok: true };
 });
-route('DELETE', '/api/goals/(\\d+)', ({ user, params }) => {
-  const g = own('educational_goals', +params[0], user);
+route('DELETE', '/api/goals/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const g = await own(sb, 'tutor_educational_goals', +params[0], user);
   if (user.role === 'student' && g.created_by !== user.id) throw bad('Цели от тьютора удаляет тьютор', 403);
-  q.run('DELETE FROM educational_goals WHERE id=?', g.id);
-  log(g.student_id, user.id, 'goal', `Удалена цель «${g.title}»`);
+  await remove(sb, 'tutor_educational_goals', g.id);
+  await log(sb, g.student_id, user.id, 'goal', `Удалена цель «${g.title}»`);
   return { ok: true };
 });
 
 /* ── задачи ── */
-route('GET', '/api/tasks', ({ user, url }) => {
-  const sid = scope(user, url);
-  const tasks = q.all(`SELECT t.*, s.title stage_title, g.title goal_title, m.title milestone_title,
-      (SELECT COUNT(*) FROM task_comments c WHERE c.task_id=t.id) comments
-    FROM tasks t LEFT JOIN route_stages s ON s.id=t.stage_id LEFT JOIN educational_goals g ON g.id=COALESCE(t.goal_id,s.goal_id)
-    LEFT JOIN milestones m ON m.id=t.milestone_id
-    WHERE t.student_id=? ORDER BY (t.due_date IS NULL), t.due_date, t.id`, sid);
-  const p = q.get('SELECT directions FROM profiles WHERE user_id=?', sid);
-  const stages = q.all('SELECT id,title FROM route_stages WHERE student_id=? ORDER BY position', sid);
-  const milestones = q.all('SELECT id,stage_id,title FROM milestones WHERE student_id=? ORDER BY position', sid);
-  const goals = q.all("SELECT id,title FROM educational_goals WHERE student_id=? ORDER BY id", sid);
-  return { tasks, directions: JSON.parse(p.directions || '[]'), stages, milestones, goals, today: todayStr() };
+route('GET', '/api/tasks', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const tasks = await select(sb, 'tutor_tasks', { student_id: sid }, { order: 'due_date,id' });
+  const stages = await select(sb, 'tutor_route_stages', { student_id: sid }, { order: 'position' });
+  const stageMap = Object.fromEntries(stages.map((s) => [s.id, s]));
+  const ms = await select(sb, 'tutor_milestones', { student_id: sid }, { order: 'position' });
+  const goals = await select(sb, 'tutor_educational_goals', { student_id: sid }, { order: 'id' });
+  const p = await get(sb, 'profiles', { id: sid });
+  const enriched = await Promise.all(tasks.map(async (t) => {
+    const s = stageMap[t.stage_id];
+    const m = ms.find((x) => x.id === t.milestone_id);
+    const g = goals.find((x) => x.id === (t.goal_id ?? s?.goal_id));
+    const comments = await select(sb, 'tutor_task_comments', { task_id: t.id });
+    return { ...t, stage_title: s ? s.title : null, goal_title: g ? g.title : null, milestone_title: m ? m.title : null, comments: comments.length };
+  }));
+  return { tasks: enriched, directions: JSON.parse(p?.directions || '[]'), stages, milestones: ms, goals, today: todayStr() };
 });
 
-route('POST', '/api/tasks', ({ user, url, body }) => {
-  const sid = scope(user, url);
+route('POST', '/api/tasks', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   let d;
-  if (isStaff(user)) { d = V(body, S.taskStaff); delete d.tutor_feedback; }
+  const staff = isStaff(user);
+  if (staff) { d = V(body, S.taskStaff); delete d.tutor_feedback; }
   else {
     d = V(body, S.taskStaff);
     for (const k of ['tutor_feedback', 'instructions', 'resource_id']) delete d[k];
-    if (d.status === 'Выполнено') d.status = 'Выполнено';
   }
-  checkRefs(sid, d);
-  const source = isStaff(user) ? 'tutor' : 'personal';
+  await checkRefs(sb, sid, d);
+  const source = staff ? 'tutor' : 'personal';
   const st = d.status || 'Не начато';
-  const id = ins('tasks', {
+  const inserted = await insert(sb, 'tutor_tasks', {
     ...d, student_id: sid, priority: d.priority || 'Обычный', status: st, type: d.type || 'Самостоятельная работа', source,
-    completed_at: st === 'Выполнено' ? nowIso() : null, created_by: user.id, created_at: nowIso(), updated_at: nowIso(),
+    completed_at: st === 'Выполнено' ? new Date().toISOString() : null, created_by: user.id, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
   });
+  const id = inserted.id;
   if (source === 'tutor') {
-    log(sid, user.id, 'task', `Назначена задача «${d.title}»`);
-    notify(sid, 'task', 'Новая задача', `«${d.title}»${d.due_date ? ' · срок ' + d.due_date : ''}`, '#/tasks', 'task-new-' + id);
-  } else log(sid, user.id, 'task', `Добавлена личная задача «${d.title}»`);
+    await log(sb, sid, user.id, 'task', `Назначена задача «${d.title}»`);
+    await notify(sb, sid, 'task', 'Новая задача', `«${d.title}»${d.due_date ? ' · срок ' + d.due_date : ''}`, '#/tasks', `task-new-${id}`);
+  } else await log(sb, sid, user.id, 'task', `Добавлена личная задача «${d.title}»`);
   return { id };
 });
 
-route('PATCH', '/api/tasks/(\\d+)', ({ user, params, body }) => {
-  const t = own('tasks', +params[0], user);
+route('PATCH', '/api/tasks/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  const t = await own(sb, 'tutor_tasks', +params[0], user);
   let d = V(body, S.taskStaff, true);
   const staff = isStaff(user);
   const personal = t.source === 'personal';
@@ -488,225 +593,292 @@ route('PATCH', '/api/tasks/(\\d+)', ({ user, params, body }) => {
     if (d.status === 'Выполнено') d.status = 'На проверке';
   }
   if (!staff && personal) { delete d.tutor_feedback; delete d.instructions; delete d.resource_id; }
-  checkRefs(t.student_id, d);
+  await checkRefs(sb, t.student_id, d);
   if (d.status && d.status !== t.status) {
-    if (d.status === 'Выполнено') d.completed_at = nowIso();
+    if (d.status === 'Выполнено') d.completed_at = new Date().toISOString();
     else if (t.status === 'Выполнено') d.completed_at = null;
   }
-  d.updated_at = nowIso();
-  upd('tasks', t.id, d);
+  d.updated_at = new Date().toISOString();
+  await update(sb, 'tutor_tasks', t.id, d);
   const ns = d.status;
   if (ns && ns !== t.status) {
     if (ns === 'Выполнено') {
-      log(t.student_id, user.id, 'task_done', `Выполнена задача «${t.title}»`);
-      if (staff && t.status === 'На проверке') notify(t.student_id, 'review', 'Задача принята', `«${t.title}»${d.tutor_feedback ? ' — ' + d.tutor_feedback.slice(0, 120) : ''}`, '#/tasks');
+      await log(sb, t.student_id, user.id, 'task_done', `Выполнена задача «${t.title}»`);
+      if (staff && t.status === 'На проверке') await notify(sb, t.student_id, 'review', 'Задача принята', `«${t.title}»${d.tutor_feedback ? ' — ' + d.tutor_feedback.slice(0, 120) : ''}`, '#/tasks');
     } else if (ns === 'На проверке') {
-      log(t.student_id, user.id, 'task', `Задача «${t.title}» отправлена на проверку`);
-      tutorsOf(t.student_id).forEach((tid) => notify(tid, 'review', 'Задача на проверке', `${nameOf(t.student_id)}: «${t.title}»`, `#/student/${t.student_id}/tasks`));
+      await log(sb, t.student_id, user.id, 'task', `Задача «${t.title}» отправлена на проверку`);
+      const tutors = await tutorsOf(sb, t.student_id);
+      for (const tid of tutors) await notify(sb, tid, 'review', 'Задача на проверке', `${await nameOf(sb, t.student_id)}: «${t.title}»`, `#/student/${t.student_id}/tasks`);
     } else if (staff && t.status === 'На проверке' && ns === 'В процессе') {
-      log(t.student_id, user.id, 'task', `Задача «${t.title}» возвращена на доработку`);
-      notify(t.student_id, 'review', 'Задача возвращена на доработку', `«${t.title}»${d.tutor_feedback ? ' — ' + d.tutor_feedback.slice(0, 120) : ''}`, '#/tasks');
+      await log(sb, t.student_id, user.id, 'task', `Задача «${t.title}» возвращена на доработку`);
+      await notify(sb, t.student_id, 'review', 'Задача возвращена на доработку', `«${t.title}»${d.tutor_feedback ? ' — ' + d.tutor_feedback.slice(0, 120) : ''}`, '#/tasks');
     }
   } else if (staff && d.tutor_feedback && d.tutor_feedback !== t.tutor_feedback) {
-    notify(t.student_id, 'comment', 'Обратная связь по задаче', `«${t.title}»`, '#/tasks');
+    await notify(sb, t.student_id, 'comment', 'Обратная связь по задаче', `«${t.title}»`, '#/tasks');
   }
   return { ok: true, status: ns || t.status };
 });
 
-route('DELETE', '/api/tasks/(\\d+)', ({ user, params }) => {
-  const t = own('tasks', +params[0], user);
+route('DELETE', '/api/tasks/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const t = await own(sb, 'tutor_tasks', +params[0], user);
   if (!isStaff(user) && t.source !== 'personal') throw bad('Задачи тьютора удаляет тьютор', 403);
-  q.run('DELETE FROM tasks WHERE id=?', t.id);
+  await remove(sb, 'tutor_tasks', t.id);
   return { ok: true };
 });
 
-route('GET', '/api/tasks/(\\d+)/comments', ({ user, params }) => {
-  const t = own('tasks', +params[0], user);
-  return q.all(`SELECT c.id,c.body,c.created_at,c.author_id,p.full_name author FROM task_comments c JOIN profiles p ON p.user_id=c.author_id WHERE c.task_id=? ORDER BY c.id`, t.id);
+route('GET', '/api/tasks/(\\d+)/comments', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const t = await own(sb, 'tutor_tasks', +params[0], user);
+  const rows = await select(sb, 'tutor_task_comments', { task_id: t.id }, { order: 'id' });
+  return Promise.all(rows.map(async (c) => {
+    const p = await get(sb, 'profiles', { id: c.author_id });
+    return { ...c, author: p ? p.full_name : '' };
+  }));
 });
-route('POST', '/api/tasks/(\\d+)/comments', ({ user, params, body }) => {
-  const t = own('tasks', +params[0], user);
+route('POST', '/api/tasks/(\\d+)/comments', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  const t = await own(sb, 'tutor_tasks', +params[0], user);
   const d = V(body, { body: { t: 'text', req: 1, max: 1500, label: 'Комментарий' } });
-  const id = ins('task_comments', { task_id: t.id, student_id: t.student_id, author_id: user.id, body: d.body, created_at: nowIso() });
-  if (isStaff(user)) notify(t.student_id, 'comment', 'Новый комментарий к задаче', `«${t.title}»: ${d.body.slice(0, 100)}`, '#/tasks');
-  else tutorsOf(t.student_id).forEach((tid) => notify(tid, 'comment', 'Комментарий ученика', `${nameOf(t.student_id)} · «${t.title}»`, `#/student/${t.student_id}/tasks`));
+  const inserted = await insert(sb, 'tutor_task_comments', { task_id: t.id, student_id: t.student_id, author_id: user.id, body: d.body, created_at: new Date().toISOString() });
+  const id = inserted.id;
+  if (isStaff(user)) await notify(sb, t.student_id, 'comment', 'Новый комментарий к задаче', `«${t.title}»: ${d.body.slice(0, 100)}`, '#/tasks');
+  else {
+    const tutors = await tutorsOf(sb, t.student_id);
+    for (const tid of tutors) await notify(sb, tid, 'comment', 'Комментарий ученика', `${await nameOf(sb, t.student_id)} · «${t.title}»`, `#/student/${t.student_id}/tasks`);
+  }
   return { id };
 });
 
 /* ── обратная связь тьютора ── */
-route('POST', '/api/feedback', ({ user, url, body }) => {
-  needStaff(user); const sid = scope(user, url);
+route('POST', '/api/feedback', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const d = V(body, { text: { t: 'text', req: 1, max: 2000, label: 'Комментарий' } });
-  log(sid, user.id, 'tutor_comment', d.text);
-  notify(sid, 'comment', 'Комментарий тьютора', d.text.slice(0, 140), '#/home');
+  await log(sb, sid, user.id, 'tutor_comment', d.text);
+  await notify(sb, sid, 'comment', 'Комментарий тьютора', d.text.slice(0, 140), '#/home');
   return { ok: true };
 });
-route('GET', '/api/feedback', ({ user, url }) => {
-  const sid = scope(user, url);
-  return q.all(`SELECT a.id,a.text,a.created_at,p.full_name actor FROM activity_logs a LEFT JOIN profiles p ON p.user_id=a.actor_id
-    WHERE a.student_id=? AND a.kind='tutor_comment' ORDER BY a.created_at DESC, a.id DESC LIMIT 50`, sid);
+route('GET', '/api/feedback', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const rows = await select(sb, 'tutor_activity_logs', { student_id: sid, kind: 'tutor_comment' }, { order: 'created_at,id', limit: 50 });
+  return Promise.all(rows.map(async (a) => {
+    const p = a.actor_id ? await get(sb, 'profiles', { id: a.actor_id }) : null;
+    return { id: a.id, text: a.text, created_at: a.created_at, actor: p ? p.full_name : '' };
+  }));
 });
-route('PATCH', '/api/student-profile', ({ user, url, body }) => {
-  needStaff(user); const sid = scope(user, url);
+route('PATCH', '/api/student-profile', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const d = V(body, {
     motivation: { t: 'str', max: 300, label: 'Фраза' }, main_goal: { t: 'str', max: 300, label: 'Цель' },
     status: { t: 'str', max: 80, label: 'Статус' },
   }, true);
   const k = Object.keys(d);
-  if (k.length) q.run(`UPDATE profiles SET ${k.map((x) => x + '=?').join(',')} WHERE user_id=?`, ...k.map((x) => d[x] ?? null), sid);
+  if (k.length) await update(sb, 'profiles', sid, d);
   return { ok: true };
 });
 
 /* ── события ── */
-route('GET', '/api/events', ({ user, url }) => q.all('SELECT * FROM events WHERE student_id=? ORDER BY starts_at', scope(user, url)));
-route('POST', '/api/events', ({ user, url, body }) => {
-  needStaff(user); const sid = scope(user, url);
-  const d = V(body, S.event);
-  const id = ins('events', { ...d, kind: d.kind || 'session', student_id: sid, created_by: user.id });
-  notify(sid, 'route', 'Новое событие', `${d.title} · ${d.starts_at.replace('T', ' ')}`, '#/home');
-  return { id };
+route('GET', '/api/events', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  return select(sb, 'tutor_events', { student_id: sid }, { order: 'starts_at' });
 });
-route('DELETE', '/api/events/(\\d+)', ({ user, params }) => {
-  needStaff(user); const e = own('events', +params[0], user);
-  q.run('DELETE FROM events WHERE id=?', e.id); return { ok: true };
+route('POST', '/api/events', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const d = V(body, S.event);
+  const inserted = await insert(sb, 'tutor_events', { ...d, kind: d.kind || 'session', student_id: sid, created_by: user.id });
+  await notify(sb, sid, 'route', 'Новое событие', `${d.title} · ${d.starts_at.replace('T', ' ')}`, '#/home');
+  return { id: inserted.id };
+});
+route('DELETE', '/api/events/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const e = await own(sb, 'tutor_events', +params[0], user);
+  await remove(sb, 'tutor_events', e.id);
+  return { ok: true };
 });
 
 /* ── библиотека ── */
-route('GET', '/api/resources', ({ user, url }) => {
-  const sid = scope(user, url);
-  const items = q.all(`SELECT r.*, s.title stage_title FROM resources r LEFT JOIN route_stages s ON s.id=r.stage_id WHERE r.owner_student_id=? ORDER BY r.favorite DESC, r.id DESC`, sid);
+route('GET', '/api/resources', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const items = await select(sb, 'tutor_resources', { owner_student_id: sid }, { order: 'favorite,id' });
+  const stages = await select(sb, 'tutor_route_stages', { student_id: sid }, { order: 'position' });
+  const stageMap = Object.fromEntries(stages.map((s) => [s.id, s.title]));
+  const enriched = items.map((r) => ({ ...r, stage_title: r.stage_id ? stageMap[r.stage_id] : null }));
   return {
-    items, categories: q.all('SELECT name FROM resource_categories ORDER BY position').map((c) => c.name),
-    stages: q.all('SELECT id,title FROM route_stages WHERE student_id=? ORDER BY position', sid),
+    items: enriched,
+    categories: (await select(sb, 'tutor_resource_categories', {}, { order: 'position' })).map((c) => c.name),
+    stages: stages.map((s) => ({ id: s.id, title: s.title })),
   };
 });
-route('POST', '/api/resources', ({ user, url, body }) => {
-  const sid = scope(user, url);
-  const d = V(body, S.resource); checkRefs(sid, d);
+route('POST', '/api/resources', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const d = V(body, S.resource);
+  await checkRefs(sb, sid, d);
   const staff = isStaff(user);
-  if (!staff) { delete d.tutor_note; }
-  const id = ins('resources', {
-    ...d, status: d.status || 'К изучению', favorite: d.favorite || 0, owner_student_id: sid,
-    tutor_id: staff ? user.id : null, added_by_self: staff ? 0 : 1, created_at: nowIso(),
+  if (!staff) delete d.tutor_note;
+  const inserted = await insert(sb, 'tutor_resources', {
+    ...d, status: d.status || 'К изучению', favorite: d.favorite || false, owner_student_id: sid,
+    tutor_id: staff ? user.id : null, added_by_self: staff ? false : true, created_at: new Date().toISOString(),
   });
-  log(sid, user.id, 'resource', `Добавлен материал «${d.title}»`);
-  if (staff) notify(sid, 'resource', 'Новый материал', `«${d.title}»`, '#/library');
+  const id = inserted.id;
+  await log(sb, sid, user.id, 'resource', `Добавлен материал «${d.title}»`);
+  if (staff) await notify(sb, sid, 'resource', 'Новый материал', `«${d.title}»`, '#/library');
   return { id };
 });
-route('PATCH', '/api/resources/(\\d+)', ({ user, params, body }) => {
-  const r = own('resources', +params[0], user);
+route('PATCH', '/api/resources/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_resources', +params[0], user);
   let d = V(body, S.resource, true);
   if (!isStaff(user)) {
     if (r.added_by_self) delete d.tutor_note;
     else d = Object.fromEntries(Object.entries(d).filter(([k]) => ['status', 'favorite'].includes(k)));
   }
-  checkRefs(r.owner_student_id, d);
-  upd('resources', r.id, d);
+  await checkRefs(sb, r.owner_student_id, d);
+  await update(sb, 'tutor_resources', r.id, d);
   return { ok: true };
 });
-route('DELETE', '/api/resources/(\\d+)', ({ user, params }) => {
-  const r = own('resources', +params[0], user);
+route('DELETE', '/api/resources/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_resources', +params[0], user);
   if (!isStaff(user) && !r.added_by_self) throw bad('Материалы тьютора удаляет тьютор', 403);
-  q.run('DELETE FROM resources WHERE id=?', r.id); return { ok: true };
+  await remove(sb, 'tutor_resources', r.id);
+  return { ok: true };
 });
-// общая библиотека тьютора
-route('GET', '/api/library/shared', ({ user }) => {
+route('GET', '/api/library/shared', async ({ user }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
-  return q.all('SELECT * FROM resources WHERE owner_student_id IS NULL AND tutor_id=? ORDER BY id DESC', user.id);
+  return select(sb, 'tutor_resources', { owner_student_id: null, tutor_id: user.id }, { order: 'id' });
 });
-route('POST', '/api/library/shared', ({ user, body }) => {
+route('POST', '/api/library/shared', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
   const d = V(body, S.resource); delete d.stage_id; delete d.favorite; delete d.status;
-  return { id: ins('resources', { ...d, owner_student_id: null, tutor_id: user.id, created_at: nowIso() }) };
+  const inserted = await insert(sb, 'tutor_resources', { ...d, owner_student_id: null, tutor_id: user.id, created_at: new Date().toISOString() });
+  return { id: inserted.id };
 });
-route('DELETE', '/api/library/shared/(\\d+)', ({ user, params }) => {
+route('DELETE', '/api/library/shared/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
-  const r = q.get('SELECT * FROM resources WHERE id=? AND owner_student_id IS NULL AND tutor_id=?', +params[0], user.id);
+  const r = await get(sb, 'tutor_resources', { id: +params[0], owner_student_id: null, tutor_id: user.id });
   if (!r) throw bad('Не найдено', 404);
-  q.run('DELETE FROM resources WHERE id=?', r.id); return { ok: true };
+  await remove(sb, 'tutor_resources', r.id);
+  return { ok: true };
 });
-route('POST', '/api/library/assign', ({ user, body }) => {
+route('POST', '/api/library/assign', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
-  const r = q.get('SELECT * FROM resources WHERE id=? AND owner_student_id IS NULL AND tutor_id=?', Number(body.resource_id), user.id);
+  const r = await get(sb, 'tutor_resources', { id: Number(body.resource_id), owner_student_id: null, tutor_id: user.id });
   if (!r) throw bad('Материал не найден', 404);
   const ids = Array.isArray(body.student_ids) ? body.student_ids.map(Number).filter(Boolean).slice(0, 100) : [];
   if (!ids.length) throw bad('Выберите учеников');
   let n = 0;
   for (const sid of ids) {
-    assertAccess(user, sid);
-    ins('resources', { owner_student_id: sid, tutor_id: user.id, title: r.title, description: r.description, category: r.category, url: r.url, tutor_note: r.tutor_note, status: 'К изучению', added_by_self: 0, created_at: nowIso() });
-    log(sid, user.id, 'resource', `Добавлен материал «${r.title}»`);
-    notify(sid, 'resource', 'Новый материал', `«${r.title}»`, '#/library'); n++;
+    await assertAccessBySid(user, String(sid));
+    await insert(sb, 'tutor_resources', { owner_student_id: sid, tutor_id: user.id, title: r.title, description: r.description, category: r.category, url: r.url, tutor_note: r.tutor_note, status: 'К изучению', added_by_self: false, created_at: new Date().toISOString() });
+    await log(sb, sid, user.id, 'resource', `Добавлен материал «${r.title}»`);
+    await notify(sb, sid, 'resource', 'Новый материал', `«${r.title}»`, '#/library');
+    n++;
   }
   return { assigned: n };
 });
 
 /* ── рефлексия ── */
-route('GET', '/api/reflections', ({ user, url }) => {
-  const sid = scope(user, url);
-  let rows = q.all('SELECT * FROM reflections WHERE student_id=? ORDER BY created_at DESC, id DESC', sid);
+route('GET', '/api/reflections', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  let rows = await select(sb, 'tutor_reflections', { student_id: sid }, { order: 'created_at,id' });
   if (user.role !== 'student') rows = rows.filter((r) => !r.is_private);
+  const questions = await select(sb, 'tutor_reflection_questions', { student_id: sid }, { order: 'id' });
   return {
     items: rows.map((r) => ({ ...r, answers: JSON.parse(r.answers || '{}') })),
-    questions: q.all('SELECT id,text,created_at FROM reflection_questions WHERE student_id=? ORDER BY id DESC', sid),
+    questions,
   };
 });
-route('POST', '/api/reflections', ({ user, body }) => {
+route('POST', '/api/reflections', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   if (user.role !== 'student') throw bad('Записи ведёт ученик', 403);
   const a = body.answers;
   if (!a || typeof a !== 'object' || Array.isArray(a)) throw bad('Нет ответов');
   const clean = {}; let n = 0;
-  for (const [k, v] of Object.entries(a).slice(0, 20)) { const t = String(v || '').trim().slice(0, 3000); if (t) { clean[String(k).slice(0, 300)] = t; n++; } }
+  const entries = Object.entries(a).slice(0, 20);
+  for (const [k, v] of entries) { const t = String(v || '').trim().slice(0, 3000); if (t) { clean[String(k).slice(0, 300)] = t; n++; } }
   if (!n) throw bad('Заполните хотя бы один ответ');
-  const id = ins('reflections', { student_id: user.id, answers: JSON.stringify(clean), is_private: body.is_private ? 1 : 0, created_at: nowIso() });
-  log(user.id, user.id, 'reflection', body.is_private ? 'Добавлена личная запись рефлексии' : 'Добавлена запись рефлексии');
-  return { id };
+  const inserted = await insert(sb, 'tutor_reflections', { student_id: user.id, answers: JSON.stringify(clean), is_private: body.is_private ? true : false, created_at: new Date().toISOString() });
+  await log(sb, user.id, user.id, 'reflection', body.is_private ? 'Добавлена личная запись рефлексии' : 'Добавлена запись рефлексии');
+  return { id: inserted.id };
 });
-route('PATCH', '/api/reflections/(\\d+)', ({ user, params, body }) => {
-  const r = own('reflections', +params[0], user);
+route('PATCH', '/api/reflections/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_reflections', +params[0], user);
   if (user.role !== 'student') throw bad('Нет доступа', 403);
-  q.run('UPDATE reflections SET is_private=? WHERE id=?', body.is_private ? 1 : 0, r.id); return { ok: true };
+  await update(sb, 'tutor_reflections', r.id, { is_private: body.is_private ? true : false });
+  return { ok: true };
 });
-route('DELETE', '/api/reflections/(\\d+)', ({ user, params }) => {
-  const r = own('reflections', +params[0], user);
+route('DELETE', '/api/reflections/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_reflections', +params[0], user);
   if (user.role !== 'student') throw bad('Нет доступа', 403);
-  q.run('DELETE FROM reflections WHERE id=?', r.id); return { ok: true };
+  await remove(sb, 'tutor_reflections', r.id);
+  return { ok: true };
 });
-route('POST', '/api/reflection-questions', ({ user, url, body }) => {
-  needStaff(user); const sid = scope(user, url);
+route('POST', '/api/reflection-questions', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  needStaff(user);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const d = V(body, { text: { t: 'str', req: 1, max: 300, label: 'Вопрос' } });
-  notify(sid, 'comment', 'Новый вопрос для рефлексии', d.text, '#/reflection');
-  return { id: ins('reflection_questions', { student_id: sid, text: d.text, created_by: user.id, created_at: nowIso() }) };
+  await notify(sb, sid, 'comment', 'Новый вопрос для рефлексии', d.text, '#/reflection');
+  const inserted = await insert(sb, 'tutor_reflection_questions', { student_id: sid, text: d.text, created_by: user.id, created_at: new Date().toISOString() });
+  return { id: inserted.id };
 });
-route('DELETE', '/api/reflection-questions/(\\d+)', ({ user, params }) => {
-  const r = own('reflection_questions', +params[0], user);
-  q.run('DELETE FROM reflection_questions WHERE id=?', r.id); return { ok: true };
+route('DELETE', '/api/reflection-questions/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_reflection_questions', +params[0], user);
+  await remove(sb, 'tutor_reflection_questions', r.id);
+  return { ok: true };
 });
 
 /* ── результаты / достижения ── */
-route('GET', '/api/records', ({ user, url }) => q.all('SELECT * FROM progress_records WHERE student_id=? ORDER BY recorded_at DESC, id DESC', scope(user, url)));
-route('POST', '/api/records', ({ user, url, body }) => {
-  const sid = scope(user, url);
-  const d = V(body, S.record);
-  const id = ins('progress_records', { ...d, student_id: sid });
-  log(sid, user.id, 'record', `Зафиксировано: ${d.title}${d.value ? ' — ' + d.value : ''}`);
-  return { id };
+route('GET', '/api/records', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  return select(sb, 'tutor_progress_records', { student_id: sid }, { order: 'recorded_at,id' });
 });
-route('DELETE', '/api/records/(\\d+)', ({ user, params }) => {
-  const r = own('progress_records', +params[0], user);
-  q.run('DELETE FROM progress_records WHERE id=?', r.id); return { ok: true };
+route('POST', '/api/records', async ({ user, url, body }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const d = V(body, S.record);
+  const inserted = await insert(sb, 'tutor_progress_records', { ...d, student_id: sid });
+  await log(sb, sid, user.id, 'record', `Зафиксировано: ${d.title}${d.value ? ' — ' + d.value : ''}`);
+  return { id: inserted.id };
+});
+route('DELETE', '/api/records/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  const r = await own(sb, 'tutor_progress_records', +params[0], user);
+  await remove(sb, 'tutor_progress_records', r.id);
+  return { ok: true };
 });
 
 /* ── аналитика и отчёт ── */
 const monday = (ds) => { const d = new Date(ds + 'T00:00:00Z'); const w = (d.getUTCDay() + 6) % 7; d.setUTCDate(d.getUTCDate() - w); return d.toISOString().slice(0, 10); };
 const addDays = (ds, n) => { const d = new Date(ds + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
 
-route('GET', '/api/analytics', ({ user, url }) => {
-  const sid = scope(user, url);
+route('GET', '/api/analytics', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const T = todayStr();
-  const tasks = q.all('SELECT * FROM tasks WHERE student_id=?', sid);
+  const tasks = await select(sb, 'tutor_tasks', { student_id: sid });
   const done = tasks.filter((t) => t.status === 'Выполнено' && t.completed_at);
-  const dday = (t) => t.completed_at.slice(0, 10);
+  const dday = (t) => String(t.completed_at).slice(0, 10);
   const wk0 = monday(T);
   const weeks = [];
   for (let i = 11; i >= 0; i--) {
@@ -714,7 +886,7 @@ route('GET', '/api/analytics', ({ user, url }) => {
     weeks.push({
       from, done: done.filter((t) => dday(t) >= from && dday(t) <= to).length,
       planned: tasks.filter((t) => t.due_date && t.due_date >= from && t.due_date <= to).length,
-      progress: computeRoute(sid, i === 0 ? T : to).overall,
+      progress: (await computeRoute(sb, sid, i === 0 ? T : to)).overall,
     });
   }
   const months = [];
@@ -723,145 +895,266 @@ route('GET', '/api/analytics', ({ user, url }) => {
     const key = d.toISOString().slice(0, 7);
     months.push({ key, done: done.filter((t) => dday(t).startsWith(key)).length });
   }
-  const p = q.get('SELECT directions FROM profiles WHERE user_id=?', sid);
-  const dirNames = [...new Set([...JSON.parse(p.directions || '[]'), ...tasks.map((t) => t.direction).filter(Boolean)])];
-  const directions = dirNames.map((name) => {
+  const p = await get(sb, 'profiles', { id: sid });
+  const dirNames = [...new Set([...JSON.parse(p?.directions || '[]'), ...tasks.map((t) => t.direction).filter(Boolean)])];
+  const directions = [];
+  for (const name of dirNames) {
     const ts = tasks.filter((t) => t.direction === name);
-    let tot = 0, dn = 0; ts.forEach((t) => { const w = WEIGHT[t.priority] || 2; tot += w; if (t.status === 'Выполнено') dn += w; });
-    return { name, total: ts.length, done: ts.filter((t) => t.status === 'Выполнено').length, pct: tot ? Math.round((dn / tot) * 100) : 0, minutes: ts.reduce((a, t) => a + t.minutes_spent, 0) };
-  });
-  const r = computeRoute(sid);
+    let tot = 0, dn = 0;
+    for (const t of ts) { const w = WEIGHT[t.priority] || 2; tot += w; if (t.status === 'Выполнено') dn += w; }
+    directions.push({ name, total: ts.length, done: ts.filter((t) => t.status === 'Выполнено').length, pct: tot ? Math.round((dn / tot) * 100) : 0, minutes: ts.reduce((a, t) => a + t.minutes_spent, 0) });
+  }
+  const r = await computeRoute(sb, sid);
   const plan = r.stages.map((s) => ({
     title: s.title, start: s.start_date, planned_end: s.end_date, actual_end: s.actual_end, pct: s.pct, status: s.status,
     delta: s.actual_end && s.end_date ? Math.round((Date.parse(s.actual_end) - Date.parse(s.end_date)) / 864e5) : null,
   }));
   const lateDone = done.filter((t) => t.due_date);
   const onTime = lateDone.filter((t) => dday(t) <= t.due_date).length;
-  const goals = goalProgress(sid).map((g) => ({ id: g.id, title: g.title, pct: g.pct, status: g.status, category: g.category, target_date: g.target_date }));
+  const goals = await goalProgress(sb, sid);
   return {
     overall: r.overall, doneStages: r.doneStages, totalStages: r.totalStages, tasksDone: done.length, tasksTotal: tasks.length,
     minutes: tasks.reduce((a, t) => a + t.minutes_spent, 0), onTimePct: lateDone.length ? Math.round((onTime / lateDone.length) * 100) : null,
     weeks, months, directions, plan, goals,
-    records: q.all('SELECT * FROM progress_records WHERE student_id=? ORDER BY recorded_at DESC, id DESC', sid), today: T,
+    records: await select(sb, 'tutor_progress_records', { student_id: sid }, { order: 'recorded_at,id' }), today: T,
   };
 });
 
-route('GET', '/api/report', ({ user, url }) => {
-  const sid = scope(user, url);
+route('GET', '/api/report', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
   const from = coerce(url.searchParams.get('from'), { t: 'date', req: 1, label: 'С' }, 'from');
   const to = coerce(url.searchParams.get('to'), { t: 'date', req: 1, label: 'По' }, 'to');
   if (from > to) throw bad('Неверный период');
-  const p = q.get('SELECT * FROM profiles WHERE user_id=?', sid);
-  const inRange = (s) => s && s.slice(0, 10) >= from && s.slice(0, 10) <= to;
-  const tasks = q.all("SELECT t.*, s.title stage_title FROM tasks t LEFT JOIN route_stages s ON s.id=t.stage_id WHERE t.student_id=? AND t.status='Выполнено'", sid).filter((t) => inRange(t.completed_at));
-  const r0 = computeRoute(sid, addDays(from, -1)), r1 = computeRoute(sid, to);
+  const p = await get(sb, 'profiles', { id: sid });
+  const inRange = (s) => s && String(s).slice(0, 10) >= from && String(s).slice(0, 10) <= to;
+  const tasks = await select(sb, 'tutor_tasks', { student_id: sid });
+  const doneTasks = tasks.filter((t) => t.status === 'Выполнено').filter((t) => inRange(t.completed_at));
+  const r0 = await computeRoute(sb, sid, addDays(from, -1));
+  const r1 = await computeRoute(sb, sid, to);
+  const stagesCompleted = r1.stages.filter((s) => s.status === 'completed' && inRange(s.actual_end)).map((s) => ({ title: s.title, date: s.actual_end }));
+  const records = await select(sb, 'tutor_progress_records', { student_id: sid }, { order: 'recorded_at' });
+  const goalsAchievedLogs = await select(sb, 'tutor_activity_logs', { student_id: sid, kind: 'goal' }, { order: 'created_at' });
+  const goalsAchieved = goalsAchievedLogs.filter((x) => inRange(x.created_at) && /Цель достигнута/.test(x.text));
+  const commentsLogs = await select(sb, 'tutor_activity_logs', { student_id: sid, kind: 'tutor_comment' }, { order: 'created_at' });
+  const comments = commentsLogs.filter((x) => inRange(x.created_at));
+  const routeLogs = await select(sb, 'tutor_activity_logs', { student_id: sid, kind: 'route' }, { order: 'created_at' });
+  const routeChanges = routeLogs.filter((x) => inRange(x.created_at));
   return {
-    student: { name: p.full_name, main_goal: p.main_goal }, from, to,
+    student: { name: p?.full_name, main_goal: p?.main_goal }, from, to,
     progressStart: r0.overall, progressEnd: r1.overall,
-    stagesCompleted: r1.stages.filter((s) => s.status === 'completed' && inRange(s.actual_end)).map((s) => ({ title: s.title, date: s.actual_end })),
-    tasks: tasks.map((t) => ({ title: t.title, direction: t.direction, stage: t.stage_title, date: t.completed_at.slice(0, 10), minutes: t.minutes_spent })),
-    minutes: tasks.reduce((a, t) => a + t.minutes_spent, 0),
-    records: q.all('SELECT * FROM progress_records WHERE student_id=? ORDER BY recorded_at', sid).filter((x) => inRange(x.recorded_at)),
-    goalsAchieved: q.all("SELECT a.text, a.created_at FROM activity_logs a WHERE a.student_id=? AND a.kind='goal' AND a.text LIKE 'Цель достигнута%' ORDER BY a.created_at", sid).filter((x) => inRange(x.created_at)),
-    comments: q.all("SELECT a.text, a.created_at FROM activity_logs a WHERE a.student_id=? AND a.kind='tutor_comment' ORDER BY a.created_at", sid).filter((x) => inRange(x.created_at)),
-    routeChanges: q.all("SELECT a.text, a.created_at FROM activity_logs a WHERE a.student_id=? AND a.kind='route' ORDER BY a.created_at", sid).filter((x) => inRange(x.created_at)),
+    stagesCompleted,
+    tasks: doneTasks.map((t) => ({ title: t.title, direction: t.direction, stage: null, date: String(t.completed_at).slice(0, 10), minutes: t.minutes_spent })),
+    minutes: doneTasks.reduce((a, t) => a + t.minutes_spent, 0),
+    records: records.filter((x) => inRange(x.recorded_at)),
+    goalsAchieved: goalsAchieved.map((x) => ({ text: x.text, created_at: x.created_at })),
+    comments: comments.map((x) => ({ text: x.text, created_at: x.created_at })),
+    routeChanges: routeChanges.map((x) => ({ text: x.text, created_at: x.created_at })),
   };
 });
 
-route('GET', '/api/history', ({ user, url }) => {
-  const sid = scope(user, url);
-  const rows = q.all(`SELECT a.id,a.kind,a.text,a.created_at,p.full_name actor FROM activity_logs a LEFT JOIN profiles p ON p.user_id=a.actor_id
-    WHERE a.student_id=? ORDER BY a.created_at DESC, a.id DESC LIMIT 200`, sid);
-  return rows;
+route('GET', '/api/history', async ({ user, url }) => {
+  const sb = sbFor(user.token);
+  const sid = user.role === 'student' ? user.id : await assertAccessBySid(user, url.searchParams.get('student') || '');
+  const rows = await select(sb, 'tutor_activity_logs', { student_id: sid }, { order: 'created_at,id', limit: 200 });
+  return Promise.all(rows.map(async (a) => {
+    const p = a.actor_id ? await get(sb, 'profiles', { id: a.actor_id }) : null;
+    return { id: a.id, kind: a.kind, text: a.text, created_at: a.created_at, actor: p ? p.full_name : '' };
+  }));
 });
 
 /* ── уведомления ── */
-route('GET', '/api/notifications', ({ user }) => {
+route('GET', '/api/notifications', async ({ user }) => {
+  const sb = sbFor(user.token);
   if (user.role === 'student') {
     const T = todayStr(), soon = todayStr(2);
-    q.all("SELECT id,title,due_date FROM tasks WHERE student_id=? AND status NOT IN ('Выполнено','Отложено') AND due_date BETWEEN ? AND ?", user.id, T, soon)
-      .forEach((t) => notify(user.id, 'deadline', 'Приближается дедлайн', `«${t.title}» · ${t.due_date}`, '#/tasks', `dl-${t.id}-${t.due_date}`));
+    const tasks = await select(sb, 'tutor_tasks', { student_id: user.id });
+    for (const t of tasks) {
+      if (t.status !== 'Выполнено' && t.status !== 'Отложено' && t.due_date && t.due_date >= T && t.due_date <= soon) {
+        const ref = `dl-${t.id}-${t.due_date}`;
+        const existing = await get(sb, 'notifications', { user_id: user.id, ref });
+        if (!existing) await notify(sb, user.id, 'deadline', 'Приближается дедлайн', `«${t.title}» · ${t.due_date}`, '#/tasks', ref);
+      }
+    }
   }
-  const items = q.all('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC, id DESC LIMIT 60', user.id);
-  return { items, unread: q.get('SELECT COUNT(*) c FROM notifications WHERE user_id=? AND is_read=0', user.id).c };
+  const items = await select(sb, 'notifications', { user_id: user.id }, { order: 'created_at,id', limit: 60 });
+  const unreadRows = await select(sb, 'notifications', { user_id: user.id, is_read: false });
+  return { items, unread: unreadRows.length };
 });
-route('POST', '/api/notifications/read', ({ user, body }) => {
-  if (body.id) q.run('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?', Number(body.id), user.id);
-  else q.run('UPDATE notifications SET is_read=1 WHERE user_id=?', user.id);
+route('POST', '/api/notifications/read', async ({ user, body }) => {
+  const sb = sbFor(user.token);
+  if (body.id) await update(sb, 'notifications', Number(body.id), { is_read: true });
+  else {
+    const rows = await select(sb, 'notifications', { user_id: user.id, is_read: false });
+    for (const n of rows) await update(sb, 'notifications', n.id, { is_read: true });
+  }
   return { ok: true };
 });
 
 /* ── инструменты NMCHV ── */
-route('GET', '/api/tools', () => q.all('SELECT * FROM tools ORDER BY position,id'));
-route('POST', '/api/tools', ({ user, body }) => { needAdmin(user); return { id: ins('tools', { ...V(body, S.tool), status: body.status || 'Доступно' }) }; });
-route('PATCH', '/api/tools/(\\d+)', ({ user, params, body }) => { needAdmin(user); upd('tools', +params[0], V(body, S.tool, true)); return { ok: true }; });
-route('DELETE', '/api/tools/(\\d+)', ({ user, params }) => { needAdmin(user); q.run('DELETE FROM tools WHERE id=?', +params[0]); return { ok: true }; });
+route('GET', '/api/tools', async ({ user }) => {
+  const sb = sbFor(user.token);
+  return select(sb, 'tutor_tools', {}, { order: 'position,id' });
+});
+route('POST', '/api/tools', async ({ user, body }) => {
+  const sb = sbFor(user.token);
+  needAdmin(user);
+  const inserted = await insert(sb, 'tutor_tools', { ...V(body, S.tool), status: body.status || 'Доступно' });
+  return { id: inserted.id };
+});
+route('PATCH', '/api/tools/(\\d+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needAdmin(user);
+  await update(sb, 'tutor_tools', +params[0], V(body, S.tool, true));
+  return { ok: true };
+});
+route('DELETE', '/api/tools/(\\d+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
+  needAdmin(user);
+  await remove(sb, 'tutor_tools', +params[0]);
+  return { ok: true };
+});
 
 /* ── тьютор ── */
-route('GET', '/api/tutor/students', ({ user }) => {
+route('GET', '/api/tutor/students', async ({ user }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
-  const rows = user.role === 'admin'
-    ? q.all("SELECT id FROM users WHERE role='student' AND active=1")
-    : q.all('SELECT student_id id FROM tutor_students WHERE tutor_id=?', user.id);
+  let rows;
+  if (user.role === 'admin') {
+    rows = await select(sb, 'tutor_user_roles', { role: 'student', active: true });
+  } else {
+    const links = await select(sb, 'tutor_students', { tutor_id: user.id });
+    rows = links.map((l) => ({ user_id: l.student_id }));
+  }
   const T = todayStr();
-  return rows.map(({ id }) => {
-    const p = q.get('SELECT * FROM profiles WHERE user_id=?', id);
-    const r = computeRoute(id);
-    const u = q.get('SELECT email,active FROM users WHERE id=?', id);
-    return {
-      id, email: u.email, name: p.full_name, photo_url: p.photo_url, main_goal: p.main_goal, status: p.status,
+  const out = [];
+  for (const row of rows) {
+    const id = row.user_id;
+    const p = await get(sb, 'profiles', { id });
+    const r = await computeRoute(sb, id);
+    const u = await get(sb, 'profiles', { id }); // email from auth not in profiles; fetch role row
+    const roleRow = await get(sb, 'tutor_user_roles', { user_id: id });
+    const activeTasks = await get(sb, 'tutor_tasks', { student_id: id });
+    const active = activeTasks.filter((t) => !['Выполнено', 'Отложено'].includes(t.status)).length;
+    const review = activeTasks.filter((t) => t.status === 'На проверке').length;
+    const overdue = activeTasks.filter((t) => t.status !== 'Выполнено' && t.status !== 'Отложено' && t.due_date && t.due_date < T).length;
+    const nextDeadlineRow = activeTasks.filter((t) => t.status !== 'Выполнено' && t.status !== 'Отложено' && t.due_date && t.due_date >= T).sort((a, b) => (a.due_date || '9').localeCompare(b.due_date || '9'))[0];
+    out.push({
+      id, email: p?.email || '', name: p?.full_name, photo_url: p?.photo_url, main_goal: p?.main_goal, status: p?.status,
       stage: r.current?.title || (r.totalStages ? 'Все этапы завершены' : 'Маршрут не создан'), progress: r.overall,
-      activeTasks: q.get("SELECT COUNT(*) c FROM tasks WHERE student_id=? AND status NOT IN ('Выполнено','Отложено')", id).c,
-      review: q.get("SELECT COUNT(*) c FROM tasks WHERE student_id=? AND status='На проверке'", id).c,
-      overdue: q.get("SELECT COUNT(*) c FROM tasks WHERE student_id=? AND status NOT IN ('Выполнено','Отложено') AND due_date<?", id, T).c,
-      nextDeadline: q.get("SELECT MIN(due_date) d FROM tasks WHERE student_id=? AND status NOT IN ('Выполнено','Отложено') AND due_date>=?", id, T).d,
-      lastActivity: q.get('SELECT MAX(created_at) d FROM activity_logs WHERE student_id=? AND actor_id=?', id, id).d,
-    };
-  });
+      active, review, overdue, nextDeadline: nextDeadlineRow ? nextDeadlineRow.due_date : null,
+      lastActivity: null,
+    });
+  }
+  return out;
 });
-route('POST', '/api/tutor/students', ({ user, body }) => {
+route('POST', '/api/tutor/students', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
+  // Создание ученика требует service role (Supabase Auth admin API).
+  if (!sbAdmin) throw bad('Создание пользователей недоступно (не настроен service role)', 500);
   const dirs = Array.isArray(body.directions) ? body.directions : [];
-  const id = createUser({ email: body.email, password: body.password, role: 'student', full_name: String(body.full_name || ''), main_goal: body.main_goal || '', directions: dirs, tutorId: user.id });
+  const { data, error } = await sbAdmin.auth.admin.createUser({
+    email: body.email, password: body.password, email_confirm: true,
+    user_metadata: { full_name: String(body.full_name || '') },
+  });
+  if (error || !data.user) throw bad(error?.message || 'Не удалось создать ученика', 400);
+  const id = data.user.id;
+  await sbAdmin.from('tutor_user_roles').insert({ user_id: id, role: 'student', active: true });
+  await sbAdmin.from('profiles').insert({ id, email: body.email.toLowerCase(), full_name: String(body.full_name || ''), main_goal: body.main_goal || '', directions: JSON.stringify(dirs.slice(0, 12).map((d) => String(d).slice(0, 60))), start_date: todayStr() });
+  await sbAdmin.from('tutor_learning_routes').insert({ student_id: id, title: 'Образовательный маршрут', created_at: new Date().toISOString() });
+  await sbAdmin.from('tutor_students').insert({ tutor_id: user.id, student_id: id, created_at: new Date().toISOString() });
   return { id };
 });
-route('DELETE', '/api/tutor/students/(\\d+)', ({ user, params }) => {
+route('DELETE', '/api/tutor/students/([0-9a-f-]+)', async ({ user, params }) => {
+  const sb = sbFor(user.token);
   needStaff(user);
   if (user.role === 'admin') throw bad('Используйте раздел администратора', 400);
-  assertAccess(user, +params[0]);
-  q.run('DELETE FROM tutor_students WHERE tutor_id=? AND student_id=?', user.id, +params[0]);
+  const sid = params[0];
+  await assertAccessBySid(user, sid);
+  await removeWhere(sb, 'tutor_students', { tutor_id: user.id, student_id: sid });
   return { ok: true };
 });
 
 /* ── администратор ── */
-route('GET', '/api/admin/users', ({ user }) => {
+route('GET', '/api/admin/users', async ({ user }) => {
+  const sb = sbFor(user.token);
   needAdmin(user);
-  const users = q.all('SELECT u.id,u.email,u.role,u.active,u.created_at,p.full_name name FROM users u LEFT JOIN profiles p ON p.user_id=u.id ORDER BY u.id');
-  const links = q.all('SELECT tutor_id,student_id FROM tutor_students');
-  return { users: users.map((u) => ({ ...u, tutors: links.filter((l) => l.student_id === u.id).map((l) => l.tutor_id), students: links.filter((l) => l.tutor_id === u.id).map((l) => l.student_id) })) };
+  const users = await select(sb, 'tutor_user_roles', {}, { order: 'id' });
+  const links = await select(sb, 'tutor_students');
+  const out = [];
+  for (const ur of users) {
+    const id = ur.user_id;
+    const p = await get(sb, 'profiles', { id });
+    const roleRow = await get(sb, 'tutor_user_roles', { user_id: id });
+    out.push({
+      id, email: p?.email || '', role: roleRow?.role || ur.role, active: roleRow?.active !== false,
+      created_at: roleRow?.created_at, name: p?.full_name,
+      tutors: links.filter((l) => l.student_id === id).map((l) => l.tutor_id),
+      students: links.filter((l) => l.tutor_id === id).map((l) => l.student_id),
+    });
+  }
+  return { users: out };
 });
-route('POST', '/api/admin/users', ({ user, body }) => {
+route('POST', '/api/admin/users', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   needAdmin(user);
+  if (!sbAdmin) throw bad('Создание пользователей недоступно (не настроен service role)', 500);
   if (!['student', 'tutor', 'admin'].includes(body.role)) throw bad('Неверная роль');
-  return { id: createUser({ email: body.email, password: body.password, role: body.role, full_name: String(body.full_name || '') }) };
+  const { data, error } = await sbAdmin.auth.admin.createUser({
+    email: body.email, password: body.password, email_confirm: true,
+    user_metadata: { full_name: String(body.full_name || '') },
+  });
+  if (error || !data.user) throw bad(error?.message || 'Не удалось создать пользователя', 400);
+  const id = data.user.id;
+  await sbAdmin.from('tutor_user_roles').insert({ user_id: id, role: body.role, active: true });
+  await sbAdmin.from('profiles').insert({ id, email: body.email.toLowerCase(), full_name: String(body.full_name || ''), start_date: todayStr() });
+  if (body.role === 'student') {
+    await sbAdmin.from('tutor_learning_routes').insert({ student_id: id, created_at: new Date().toISOString() });
+  }
+  return { id };
 });
-route('PATCH', '/api/admin/users/(\\d+)', ({ user, params, body }) => {
-  needAdmin(user); const id = +params[0];
-  const u = q.get('SELECT * FROM users WHERE id=?', id); if (!u) throw bad('Не найдено', 404);
+route('PATCH', '/api/admin/users/([0-9a-f-]+)', async ({ user, params, body }) => {
+  const sb = sbFor(user.token);
+  needAdmin(user);
+  const id = String(params[0]); // uuid
+  const roleRow = await get(sb, 'tutor_user_roles', { user_id: id });
+  if (!roleRow) throw bad('Не найдено', 404);
   if (id === user.id && (body.role && body.role !== 'admin' || body.active === false || body.active === 0)) throw bad('Нельзя понизить или отключить себя');
-  if (body.role) { if (!['student', 'tutor', 'admin'].includes(body.role)) throw bad('Неверная роль'); q.run('UPDATE users SET role=? WHERE id=?', body.role, id);
-    if (body.role === 'student' && !q.get('SELECT 1 x FROM learning_routes WHERE student_id=?', id)) ins('learning_routes', { student_id: id, created_at: nowIso() }); }
-  if (body.active !== undefined) { q.run('UPDATE users SET active=? WHERE id=?', body.active ? 1 : 0, id); if (!body.active) q.run('DELETE FROM sessions WHERE user_id=?', id); }
-  if (body.password) { q.run('UPDATE users SET password_hash=? WHERE id=?', hashPw(pwOk(body.password)), id); q.run('DELETE FROM sessions WHERE user_id=?', id); }
+  if (body.role) {
+    if (!['student', 'tutor', 'admin'].includes(body.role)) throw bad('Неверная роль');
+    await sbAdmin.from('tutor_user_roles').update({ role: body.role }).eq('user_id', id);
+    if (body.role === 'student') {
+      const hasRoute = await get(sb, 'tutor_learning_routes', { student_id: id });
+      if (!hasRoute) await sbAdmin.from('tutor_learning_routes').insert({ student_id: id, created_at: new Date().toISOString() });
+    }
+  }
+  if (body.active !== undefined) {
+    await sbAdmin.from('tutor_user_roles').update({ active: body.active ? true : false }).eq('user_id', id);
+    if (!body.active) {
+      // нельзя легко удалить сессии без service role; пропускаем
+    }
+  }
+  if (body.password) {
+    const pwOk = (p) => { if (typeof p !== 'string' || p.length < 8 || p.length > 100) throw bad('Пароль: от 8 до 100 символов'); return p; };
+    await sbAdmin.auth.admin.updateUserById(id, { password: pwOk(body.password) });
+  }
   return { ok: true };
 });
-route('POST', '/api/admin/link', ({ user, body }) => {
+route('POST', '/api/admin/link', async ({ user, body }) => {
+  const sb = sbFor(user.token);
   needAdmin(user);
-  const t = q.get("SELECT id FROM users WHERE id=? AND role IN ('tutor','admin')", Number(body.tutor_id));
-  const s = q.get("SELECT id FROM users WHERE id=? AND role='student'", Number(body.student_id));
-  if (!t || !s) throw bad('Неверные пользователи');
-  if (body.unlink) q.run('DELETE FROM tutor_students WHERE tutor_id=? AND student_id=?', t.id, s.id);
-  else if (!q.get('SELECT 1 x FROM tutor_students WHERE tutor_id=? AND student_id=?', t.id, s.id)) ins('tutor_students', { tutor_id: t.id, student_id: s.id, created_at: nowIso() });
+  const tutorId = String(body.tutor_id);
+  const studentId = String(body.student_id);
+  const t = await get(sb, 'tutor_user_roles', { user_id: tutorId });
+  const s = await get(sb, 'tutor_user_roles', { user_id: studentId });
+  if (!t || t.role !== 'tutor' && t.role !== 'admin') throw bad('Неверные пользователи');
+  if (!s || s.role !== 'student') throw bad('Неверные пользователи');
+  if (body.unlink) await removeWhere(sb, 'tutor_students', { tutor_id: tutorId, student_id: studentId });
+  else {
+    const existing = await get(sb, 'tutor_students', { tutor_id: tutorId, student_id: studentId });
+    if (!existing) await insert(sb, 'tutor_students', { tutor_id: tutorId, student_id: studentId, created_at: new Date().toISOString() });
+  }
   return { ok: true };
 });
 
@@ -869,7 +1162,7 @@ route('POST', '/api/admin/link', ({ user, body }) => {
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json' };
 const SEC = {
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'same-origin',
-  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' https: data:; script-src 'self'; connect-src 'self' https://tutor.nmchv.ru; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' https: data:; script-src 'self' https://cdn.jsdelivr.net https://*.supabase.co; connect-src 'self' https://*.supabase.co; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
 };
 function send(res, code, data, headers = {}) {
   const body = typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data);
@@ -895,11 +1188,11 @@ const server = http.createServer(async (req, res) => {
       let found = null, params = [];
       for (const r of R) { if (r.method !== m) continue; const x = r.re.exec(url.pathname); if (x) { found = r; params = x.slice(1); break; } }
       if (!found) throw bad('Не найдено', 404);
-      if (m !== 'GET' && req.headers['x-requested-with'] !== 'nmchv') throw bad('Запрос отклонён', 403);
-      const user = currentUser(req);
+      if (m !== 'GET' && m !== 'HEAD' && req.headers['x-requested-with'] !== 'nmchv') throw bad('Запрос отклонён', 403);
+      const user = await currentUser(req);
       if (!found.pub && !user) throw bad('Требуется вход', 401);
       const body = m === 'GET' || m === 'DELETE' ? {} : await readBody(req);
-      const out = found.fn({ req, res, user, url, params, body });
+      const out = await found.fn({ req, res, user, url, params, body });
       return send(res, 200, out ?? { ok: true }, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') throw bad('Не найдено', 404);
@@ -917,4 +1210,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`NMCHV Student: http://localhost:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`NMCHV Tutor: http://localhost:${PORT}`));

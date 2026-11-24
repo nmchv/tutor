@@ -59,7 +59,7 @@ export const acts = {
       const r = await api('/api/tutor/students', { method: 'POST', body: { ...v, directions: v.directions.split(',').map((x) => x.trim()).filter(Boolean) } });
       close(); toast('Кабинет ученика создан'); location.hash = `#/student/${r.id}/route`;
     } }),
-  logout: async () => { await api('/api/auth/logout', { method: 'POST' }); location.hash = ''; location.reload(); },
+  logout: async () => { await api('/api/auth/logout', { method: 'POST' }); sessionStorage.removeItem('sb-token'); S.accessToken = null; S.me = null; location.hash = ''; location.reload(); },
 };
 
 /* ───── администратор ───── */
@@ -85,7 +85,8 @@ Object.assign(acts, {
     { name: 'role', label: 'Роль', type: 'select', options: Object.entries(ROLE), value: 'student', half: true }, { name: 'password', label: 'Пароль', value: genPw(), required: true, half: true, autocomplete: 'off' }],
     async onSubmit(v, close) { await api('/api/admin/users', { method: 'POST', body: v }); close(); toast('Пользователь создан'); S.refresh(); } }),
   'usr-link': (el) => {
-    const s = USERS.find((u) => u.id === +el.dataset.id), tutors = USERS.filter((u) => u.role === 'tutor' || u.role === 'admin');
+    const sid = el.dataset.id;
+    const s = USERS.find((u) => u.id === sid), tutors = USERS.filter((u) => u.role === 'tutor' || u.role === 'admin');
     modal({ title: `Тьюторы: ${s.name}`, body: `<div>${tutors.map((t) => `<label class="row" style="padding:8px 0;cursor:pointer"><input type="checkbox" value="${t.id}" ${s.tutors.includes(t.id) ? 'checked' : ''}> <span>${esc(t.name)} <span class="xs muted">${ROLE[t.role]}</span></span></label>`).join('') || '<p class="muted">Нет тьюторов</p>'}</div><div style="margin-top:14px"><button class="btn primary" id="lk-save">Сохранить</button></div>`,
       onMount(ov, close) { $('#lk-save', ov).onclick = async () => { const on = new Set([...ov.querySelectorAll('input:checked')].map((i) => +i.value));
         for (const t of tutors) { const had = s.tutors.includes(t.id), now = on.has(t.id); if (had !== now) await api('/api/admin/link', { method: 'POST', body: { tutor_id: t.id, student_id: s.id, unlink: !now } }); }

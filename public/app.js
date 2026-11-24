@@ -21,7 +21,7 @@ function parse() {
   const [path, qs] = (location.hash.slice(1) || '/').split('?');
   const parts = path.split('/').filter(Boolean);
   const params = new URLSearchParams(qs || '');
-  if (parts[0] === 'student' && parts[1]) return { sid: Number(parts[1]) || null, view: parts[2] || 'home', params };
+  if (parts[0] === 'student' && parts[1]) return { sid: parts[1], view: parts[2] || 'home', params };
   return { sid: null, view: parts[0] || '', params };
 }
 
@@ -160,20 +160,32 @@ async function renderAuth() {
         <div class="field"><label>Пароль${mode === 'reg' ? ' (от 8 символов)' : ''}</label><input name="password" type="password" required minlength="${mode === 'reg' ? 8 : 1}" autocomplete="${mode === 'reg' ? 'new-password' : 'current-password'}"></div>
         <p class="err" hidden></p><button class="btn primary block" type="submit">${mode === 'login' ? 'Войти' : 'Создать кабинет'}</button></form>
       <p class="small muted" style="margin-top:16px">${mode === 'login' ? 'Нет аккаунта? <button class="link-btn" id="sw">Зарегистрироваться</button>' : 'Уже есть аккаунт? <button class="link-btn" id="sw">Войти</button>'}</p>
+      ${mode === 'login' ? `<div class="demo-box" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--color-border)"><div class="eyebrow" style="margin-bottom:10px">Единый вход NMCHV</div><a href="${'https://login.nmchv.ru/?service=tutor&redirect=' + encodeURIComponent(location.origin + '/auth/callback')}" class="btn primary block" style="margin-bottom:8px">${icon('login', 16)} Войти через login.nmchv.ru</a><p class="xs muted">Если у вас уже есть аккаунт в экосистеме NMCHV, используйте общий вход.</p></div>` : ''}
       ${pub.demo && mode === 'login' ? `<div class="demo-box"><div class="eyebrow" style="margin-bottom:6px">Демонстрационный режим</div>${pub.accounts.map((a) => `<button type="button" data-e="${esc(a.email)}" data-p="${esc(a.password)}"><span>${{ student: 'Ученик', tutor: 'Тьютор', admin: 'Администратор' }[a.role]}</span><span class="muted">${esc(a.email)}</span></button>`).join('')}</div>` : ''}</div></div></div>`;
     $('#sw').onclick = () => { mode = mode === 'login' ? 'reg' : 'login'; draw(); };
     $$('.demo-box button').forEach((b) => (b.onclick = () => { const f = $('#auth-form'); f.email.value = b.dataset.e; f.password.value = b.dataset.p; f.requestSubmit(); }));
-    $('#auth-form').onsubmit = async (e) => {
-      e.preventDefault(); const f = e.target, err = $('.err', f); err.hidden = true;
-      const body = { email: f.email.value, password: f.password.value }; if (f.full_name) body.full_name = f.full_name.value;
-      try { S.me = await api('/api/auth/' + (mode === 'login' ? 'login' : 'register'), { method: 'POST', body }); location.hash = S.me.role === 'student' ? '#/home' : '#/students'; shellFor = null; render(); }
-      catch (x) { err.textContent = x.message; err.hidden = false; }
-    };
+      $('#auth-form').onsubmit = async (e) => {
+        e.preventDefault(); const f = e.target, err = $('.err', f); err.hidden = true;
+        const body = { email: f.email.value, password: f.password.value }; if (f.full_name) body.full_name = f.full_name.value;
+        try {
+          const r = await api('/api/auth/' + (mode === 'login' ? 'login' : 'register'), { method: 'POST', body });
+          S.accessToken = r.access_token;
+          sessionStorage.setItem('sb-token', r.access_token);
+          S.me = r;
+          location.hash = S.me.role === 'student' ? '#/home' : '#/students';
+          shellFor = null; render();
+        }
+        catch (x) { err.textContent = x.message; err.hidden = false; }
+      };
   };
   draw();
 }
 
 (async function init() {
-  try { S.me = await api('/api/me'); } catch { S.me = null; }
+  try {
+    const stored = sessionStorage.getItem('sb-token');
+    if (stored) S.accessToken = stored;
+    S.me = await api('/api/me');
+  } catch { S.me = null; }
   render();
 })();
