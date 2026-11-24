@@ -1,12 +1,10 @@
 {
   "name": "nmchv-student",
   "version": "1.0.0",
-  "description": "NMCHV Student — персональный кабинет образовательного развития",
-  "type": "module",
+  "description": "NMCHV Student — персональный кабинет образовательного развития (статический сайт для GitHub Pages)",
   "private": true,
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js",
-    "reset-db": "node --disable-warning=ExperimentalWarning scripts/reset.js"
+    "setup": "echo 'Настройте SUPABASE_URL и SUPABASE_ANON_KEY в public/config.js, затем настройте GitHub Pages в настройках репозитория.'"
   },
   "engines": {
     "node": ">=22.5"

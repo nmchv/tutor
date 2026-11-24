@@ -59,7 +59,7 @@ export const acts = {
       const r = await api('/api/tutor/students', { method: 'POST', body: { ...v, directions: v.directions.split(',').map((x) => x.trim()).filter(Boolean) } });
       close(); toast('Кабинет ученика создан'); location.hash = `#/student/${r.id}/route`;
     } }),
-  logout: async () => { await api('/api/auth/logout', { method: 'POST' }); sessionStorage.removeItem('sb-token'); S.accessToken = null; S.me = null; location.hash = ''; location.reload(); },
+  logout: async () => { await api('/api/auth/logout', { method: 'POST' }); S.me = null; location.hash = ''; location.reload(); },
 };
 
 /* ───── администратор ───── */

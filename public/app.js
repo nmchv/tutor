@@ -1,4 +1,6 @@
-import { $, $$, S, api, esc, icon, avatar, toast, ago, postRender, empty, isStaff } from './lib.js';
+import { $, $$, S, api, esc, icon, avatar, toast, postRender, empty, isStaff } from './lib.js';
+import { sb } from './config.js';
+import { insertRow, todayStr } from './lib.js';
 import * as Home from './v-home.js';
 import * as Route from './v-route.js';
 import * as Goals from './v-goals.js';
@@ -103,7 +105,7 @@ window.addEventListener('hashchange', () => { closeMenus(); render(); });
 let NOTES = [];
 async function loadBell() {
   try {
-    const d = await api('/api/notifications?student=0'.replace('?student=0', ''));
+    const d = await api('/api/notifications');
     NOTES = d.items; const n = $('#bell-n');
     if (n) { n.hidden = !d.unread; n.textContent = d.unread > 9 ? '9+' : d.unread; }
   } catch {}
@@ -141,11 +143,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && e.target.matches('tr[data-act]')) e.target.click();
 });
 
-/* ───── вход и регистрация ───── */
+/* ───── вход и регистрация (Supabase Auth на стороне клиента) ───── */
 async function renderAuth() {
   shellFor = null;
-  let pub = { demo: false, accounts: [] };
-  try { pub = await api('/api/public'); } catch {}
   let mode = 'login';
   const art = `<svg viewBox="0 0 600 800" preserveAspectRatio="xMidYMid slice" fill="none" aria-hidden="true"><defs><linearGradient id="ag" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#5b8def" stop-opacity="0"/><stop offset="1" stop-color="#5b8def" stop-opacity=".9"/></linearGradient><radialGradient id="an"><stop offset="0" stop-color="#5b8def" stop-opacity=".45"/><stop offset="1" stop-color="#5b8def" stop-opacity="0"/></radialGradient></defs>
     <g stroke="#171b23"><path d="M100 0v800M220 0v800M340 0v800M460 0v800M580 0v800M0 160h600M0 320h600M0 480h600M0 640h600"/></g>
@@ -160,32 +160,49 @@ async function renderAuth() {
         <div class="field"><label>Пароль${mode === 'reg' ? ' (от 8 символов)' : ''}</label><input name="password" type="password" required minlength="${mode === 'reg' ? 8 : 1}" autocomplete="${mode === 'reg' ? 'new-password' : 'current-password'}"></div>
         <p class="err" hidden></p><button class="btn primary block" type="submit">${mode === 'login' ? 'Войти' : 'Создать кабинет'}</button></form>
       <p class="small muted" style="margin-top:16px">${mode === 'login' ? 'Нет аккаунта? <button class="link-btn" id="sw">Зарегистрироваться</button>' : 'Уже есть аккаунт? <button class="link-btn" id="sw">Войти</button>'}</p>
-      ${mode === 'login' ? `<div class="demo-box" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--color-border)"><div class="eyebrow" style="margin-bottom:10px">Единый вход NMCHV</div><a href="${'https://login.nmchv.ru/?service=tutor&redirect=' + encodeURIComponent(location.origin + '/auth/callback')}" class="btn primary block" style="margin-bottom:8px">${icon('login', 16)} Войти через login.nmchv.ru</a><p class="xs muted">Если у вас уже есть аккаунт в экосистеме NMCHV, используйте общий вход.</p></div>` : ''}
-      ${pub.demo && mode === 'login' ? `<div class="demo-box"><div class="eyebrow" style="margin-bottom:6px">Демонстрационный режим</div>${pub.accounts.map((a) => `<button type="button" data-e="${esc(a.email)}" data-p="${esc(a.password)}"><span>${{ student: 'Ученик', tutor: 'Тьютор', admin: 'Администратор' }[a.role]}</span><span class="muted">${esc(a.email)}</span></button>`).join('')}</div>` : ''}</div></div></div>`;
+      </div></div></div>`;
     $('#sw').onclick = () => { mode = mode === 'login' ? 'reg' : 'login'; draw(); };
-    $$('.demo-box button').forEach((b) => (b.onclick = () => { const f = $('#auth-form'); f.email.value = b.dataset.e; f.password.value = b.dataset.p; f.requestSubmit(); }));
-      $('#auth-form').onsubmit = async (e) => {
-        e.preventDefault(); const f = e.target, err = $('.err', f); err.hidden = true;
-        const body = { email: f.email.value, password: f.password.value }; if (f.full_name) body.full_name = f.full_name.value;
-        try {
-          const r = await api('/api/auth/' + (mode === 'login' ? 'login' : 'register'), { method: 'POST', body });
-          S.accessToken = r.access_token;
-          sessionStorage.setItem('sb-token', r.access_token);
-          S.me = r;
-          location.hash = S.me.role === 'student' ? '#/home' : '#/students';
-          shellFor = null; render();
+    $('#auth-form').onsubmit = async (e) => {
+      e.preventDefault(); const f = e.target, err = $('.err', f); err.hidden = true;
+      const body = { email: f.email.value, password: f.password.value }; if (f.full_name) body.full_name = f.full_name.value;
+      try {
+        if (mode === 'login') {
+          const { data, error } = await sb.auth.signInWithPassword({ email: body.email, password: body.password });
+          if (error || !data.user) throw new Error('Неверный email или пароль');
+        } else {
+          const { data, error } = await sb.auth.signUp({ email: body.email, password: body.password, options: { data: { full_name: body.full_name } } });
+          if (error || !data.user) throw new Error(error?.message || 'Не удалось создать аккаунт');
+          if (!data.session) throw new Error('Не удалось создать сессию');
+          await insertRow('profiles', { id: data.user.id, email: body.email, full_name: body.full_name, start_date: todayStr() });
+          await insertRow('tutor_user_roles', { user_id: data.user.id, role: 'student', active: true });
+          await insertRow('tutor_learning_routes', { student_id: data.user.id, title: 'Образовательный маршрут', created_at: new Date().toISOString() });
         }
-        catch (x) { err.textContent = x.message; err.hidden = false; }
-      };
+        S.me = await api('/api/me');
+        location.hash = S.me.role === 'student' ? '#/home' : '#/students';
+        shellFor = null; render();
+      }
+      catch (x) { err.textContent = x.message; err.hidden = false; }
+    };
   };
   draw();
 }
 
+/* ───── инициализация с отслеживанием сессии Supabase ───── */
 (async function init() {
-  try {
-    const stored = sessionStorage.getItem('sb-token');
-    if (stored) S.accessToken = stored;
+  const { data: { session } } = await sb.auth.getSession();
+  if (session) {
     S.me = await api('/api/me');
-  } catch { S.me = null; }
+  }
+
+  sb.auth.onAuthStateChange(async (event, session) => {
+    if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+      if (session) S.me = await api('/api/me');
+    } else if (event === 'SIGNED_OUT') {
+      S.me = null;
+      location.hash = '';
+      location.reload();
+    }
+  });
+
   render();
 })();
