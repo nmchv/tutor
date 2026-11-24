@@ -1,12 +1,6 @@
 const STORAGE_KEY = 'nmchv-student-data';
 const SESSION_KEY = 'nmchv-session';
 
-const DEMO_ACCOUNTS = [
-  { role: 'student', email: 'alexey@demo.nmchv.local', password: 'Demo-2026!', name: 'Алексей Смирнов' },
-  { role: 'tutor', email: 'tutor@demo.nmchv.local', password: 'Demo-2026!', name: 'Мария Орлова' },
-  { role: 'admin', email: 'admin@demo.nmchv.local', password: 'Demo-2026!', name: 'Администратор NMCHV' },
-];
-
 let dataCache = null;
 let sessionCache = null;
 
@@ -43,27 +37,14 @@ function setSession(session) {
 }
 
 function getInitialData() {
-  const demo = window.NMCHV_DEMO_DATA;
-  if (!demo) {
-    return {
-      users: [], profiles: [], tutor_students: [],
-      learning_routes: [], route_stages: [], milestones: [],
-      educational_goals: [], tasks: [], task_comments: [],
-      resources: [], progress_records: [], reflections: [],
-      reflection_questions: [], events: [], activity_logs: [],
-      notifications: [], tools: [], resource_categories: [],
-    };
-  }
-  const profiles = [];
-  const users = demo.users.map(u => {
-    if (u.profile) {
-      profiles.push({ user_id: u.id, ...u.profile });
-      const { profile, ...user } = u;
-      return user;
-    }
-    return u;
-  });
-  return { ...demo, users, profiles };
+  return {
+    users: [], profiles: [], tutor_students: [],
+    learning_routes: [], route_stages: [], milestones: [],
+    educational_goals: [], tasks: [], task_comments: [],
+    resources: [], progress_records: [], reflections: [],
+    reflection_questions: [], events: [], activity_logs: [],
+    notifications: [], tools: [], resource_categories: [],
+  };
 }
 
 function generateId(table) {
@@ -122,9 +103,7 @@ function notify(userId, kind, title, body = '', link = null, ref = null) {
 const Store = {
   loadData, saveData, getSession, setSession, nowIso, todayStr, log, notify,
 
-  async getDemoAccounts() { return DEMO_ACCOUNTS; },
-
-  async getPublicInfo() { return { demo: true, accounts: DEMO_ACCOUNTS.map(a => ({ role: a.role, email: a.email, password: a.password })) }; },
+  async getPublicInfo() { return { demo: false, accounts: [] }; },
 
   async login(email, password) {
     const data = loadData();
