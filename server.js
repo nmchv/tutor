@@ -309,7 +309,8 @@ async function currentUserFromToken(req, token) {
   const user = await getUserFromToken(token);
   if (!user) return null;
   const sb = sbFor(token);
-  const row = await get(sb, 'tutor_user_roles', { user_id: user.id });
+  let row;
+  try { row = await get(sb, 'tutor_user_roles', { user_id: user.id }); } catch { row = null; }
   const role = row ? row.role : 'student';
   return { id: user.id, email: user.email || '', role, token };
 }
