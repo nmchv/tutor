@@ -4,8 +4,8 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
    Укажите свои URL и anon-ключ проекта Supabase.
    Получить их можно в Supabase Dashboard → Project Settings → API.
 */
-const SUPABASE_URL = 'https://ВАШ-ПРОЕКТ.supabase.co';
-const SUPABASE_ANON_KEY = 'ВАШ_ANON_КЛЮЧ';
+const SUPABASE_URL = 'https://auaespbjskmbmaylnevr.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_LW6x33mJYfznN5VMzO0Qlg_bMpazVVC';
 
 export const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
