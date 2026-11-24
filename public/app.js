@@ -161,6 +161,7 @@ async function renderAuth() {
         <p class="err" hidden></p><button class="btn primary block" type="submit">${mode === 'login' ? 'Войти' : 'Создать кабинет'}</button></form>
       <p class="small muted" style="margin-top:16px">${mode === 'login' ? 'Нет аккаунта? <button class="link-btn" id="sw">Зарегистрироваться</button>' : 'Уже есть аккаунт? <button class="link-btn" id="sw">Войти</button>'}</p>
       <p class="small muted" style="margin-top:12px;text-align:center"><button class="btn block" style="background:transparent;border:1px solid var(--color-border);color:var(--color-text-primary)" onclick="location.href='https://www.login.nmchv.ru/login?redirect='+encodeURIComponent(location.origin+'/auth/callback?redirect='+encodeURIComponent(location.pathname+location.search+location.hash))">Войти через login.nmchv.ru</button></p>
+      <div style="margin-top:24px;text-align:right;font-size:0.8rem;color:var(--color-text-muted)">© 2026 NMCHV</div>
       </div></div></div>`;
     $('#sw').onclick = () => { mode = mode === 'login' ? 'reg' : 'login'; draw(); };
     $('#auth-form').onsubmit = async (e) => {
